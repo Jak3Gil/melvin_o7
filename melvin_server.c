@@ -98,7 +98,13 @@ int parse_request(const char *buffer, size_t len, HttpRequest *req) {
     if (body_start) {
         body_start += 4;
         size_t body_size = len - (body_start - buffer);
-        if (body_size < sizeof(req->body)) {
+        
+        /* Validate body size - reject if too large */
+        if (body_size >= sizeof(req->body)) {
+            return -1; /* Body too large */
+        }
+        
+        if (body_size > 0) {
             memcpy(req->body, body_start, body_size);
             req->body_len = body_size;
         }
@@ -204,12 +210,16 @@ void handle_chat(SOCKET client, const HttpRequest *req) {
     char response_text[BUFFER_SIZE] = {0};
     char escaped_response[BUFFER_SIZE * 2] = {0}; /* Enough space for escaped chars */
     size_t escaped_len = 0;
+    size_t response_pos = 0; /* Track position in response_text */
     
-    for (uint32_t i = 0; i < output_len && i < sizeof(response_text) - 1; i++) {
+    /* Convert output array to string, handling all values correctly */
+    for (uint32_t i = 0; i < output_len && response_pos < sizeof(response_text) - 1; i++) {
         if (output[i] < 256) {
-            response_text[i] = (char)output[i];
+            response_text[response_pos++] = (char)output[i];
         }
+        /* Skip values >= 256 (they're not valid ASCII/UTF-8 bytes) */
     }
+    response_text[response_pos] = '\0'; /* Ensure null termination */
     
     /* Escape JSON special characters */
     for (size_t i = 0; i < strlen(response_text) && escaped_len < sizeof(escaped_response) - 1; i++) {
