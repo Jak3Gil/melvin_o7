@@ -2278,11 +2278,33 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
     /* Inject input */
     inject_input(g, input, input_len);
     
+    /* CRITICAL: Compute system state BEFORE propagation */
+    /* Wave prop needs current system state (avg_activation, etc.) */
+    compute_system_state(g);
+    
+    /* Ensure input nodes have strong activation to start wave */
+    /* Input nodes should be the source of activation flow */
+    for (uint32_t i = 0; i < input_len && i < g->input_length; i++) {
+        uint32_t node_id = g->input_buffer[i];
+        if (node_id < BYTE_VALUES && g->nodes[node_id].exists) {
+            /* Boost input node activation - these are the wave sources */
+            g->nodes[node_id].activation = 0.8f;  /* Strong initial activation */
+            if (g->nodes[node_id].activation > g->nodes[node_id].energy) {
+                g->nodes[node_id].activation = g->nodes[node_id].energy;
+            }
+        }
+    }
+    
     /* Propagate activation for several steps */
     /* Number of steps proportional to input length (not fixed) */
-    uint32_t num_steps = input_len * 2;
+    uint32_t num_steps = input_len * 3;  /* More steps for better propagation */
+    if (num_steps < 20) num_steps = 20;  /* Minimum steps */
+    if (num_steps > 200) num_steps = 200;  /* Maximum steps */
     
     for (uint32_t step = 0; step < num_steps; step++) {
+        /* Compute system state each step (for dynamic thresholds) */
+        compute_system_state(g);
+        
         /* Propagate */
         propagate_activation(g);
         
