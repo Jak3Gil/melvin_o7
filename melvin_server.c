@@ -310,6 +310,7 @@ void serve_file(SOCKET client, const char *path) {
     /* Open file */
     FILE *f = fopen(filepath, "rb");
     if (!f) {
+        fprintf(stderr, "File not found: %s\n", filepath);
         send_error(client, 404, "File not found");
         return;
     }
@@ -360,6 +361,9 @@ void handle_request(SOCKET client) {
         close_socket(client);
         return;
     }
+    
+    /* Debug: log request */
+    fprintf(stderr, "Request: %s %s\n", req.method, req.path);
     
     /* Handle OPTIONS (CORS preflight) */
     if (strcmp(req.method, "OPTIONS") == 0) {
