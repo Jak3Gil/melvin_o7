@@ -26,6 +26,7 @@
 #define BYTE_VALUES 256        /* Physical constraint: bytes are 0-255 */
 #define BLANK_NODE 256         /* Wildcard node - matches any byte (for generalization) */
 #define INITIAL_CAPACITY 10000  /* Starting memory allocation (grows as needed) */
+#define INVALID_PATTERN_ID 0xFFFFFFFF  /* Invalid pattern ID (for parent tracking) */
 
 #define IS_BLANK_NODE(id) ((id) == BLANK_NODE)
 #define MATCHES_BLANK(node_id, pattern_id) (IS_BLANK_NODE(pattern_id) || (node_id == pattern_id))
@@ -163,7 +164,82 @@ typedef struct {
     EdgeList outgoing_patterns; /* Edges to other patterns (dynamic array) */
     EdgeList incoming_patterns; /* Edges from other patterns */
     
+    /* ========================================================================
+     * PHASE 1: PATTERN HIERARCHY TRACKING
+     * ======================================================================== */
+    uint32_t chain_depth;          /* How deep in hierarchy (0 = root, 1 = child, etc.) */
+    uint32_t parent_pattern_id;     /* Parent pattern in hierarchy (INVALID = root) */
+    float accumulated_meaning;      /* Meaning accumulated through chain */
+    
+    /* ========================================================================
+     * PHASE 2: DYNAMIC IMPORTANCE
+     * ======================================================================== */
+    float dynamic_importance;      /* Learned importance (changes with experience) */
+    float context_frequency;       /* How often pattern appears in current context */
+    float co_occurrence_strength;  /* Strength of co-occurrence with other patterns */
+    
+    /* ========================================================================
+     * PHASE 2: PATTERN ASSOCIATION NETWORKS
+     * ======================================================================== */
+    uint32_t *associated_patterns; /* Patterns that co-occur with this pattern */
+    float *association_strengths;  /* Strength of each association */
+    uint32_t association_count;    /* Number of associations */
+    uint32_t association_capacity; /* Capacity of association arrays */
+    
+    /* ========================================================================
+     * PHASE 3: LEARNED ACTIVATION RULES (IF-THEN BEHAVIOR)
+     * ======================================================================== */
+    uint32_t *rule_condition_patterns;  /* Patterns that trigger rules (IF condition) */
+    uint32_t *rule_target_patterns;     /* Patterns boosted by rules (THEN action) */
+    float *rule_boost_amounts;           /* Boost amount for each rule */
+    float *rule_strengths;               /* Reliability of each rule (self-regulated) */
+    uint32_t rule_count;                 /* Number of learned rules */
+    uint32_t rule_capacity;              /* Capacity of rule arrays */
+    
+    /* ========================================================================
+     * SELF-REGULATING PATTERN RULES (GUIDE SYSTEM BEHAVIOR)
+     * ======================================================================== */
+    float rule_success_rate;            /* How often this pattern's rules succeed (self-regulated) */
+    float rule_confidence;              /* Confidence in pattern's rules (self-regulated) */
+    uint32_t rule_attempts;             /* How many times rules were evaluated */
+    uint32_t rule_successes;            /* How many times rules succeeded */
+    
+    /* Pattern-guided activation control */
+    float activation_control_strength;  /* How strongly this pattern controls activation flow */
+    float suppression_strength;         /* How strongly this pattern suppresses others */
+    float boost_strength;                /* How strongly this pattern boosts others */
+    
 } Pattern;
+
+/* ============================================================================
+ * HELPER: Initialize new pattern fields (all phases)
+ * ============================================================================ */
+
+void initialize_pattern_enhancements(Pattern *pat) {
+    /* PHASE 1: Initialize hierarchy tracking */
+    pat->chain_depth = 0;
+    pat->parent_pattern_id = INVALID_PATTERN_ID;
+    pat->accumulated_meaning = 0.0f;
+    
+    /* PHASE 2: Initialize dynamic importance */
+    pat->dynamic_importance = 0.5f;
+    pat->context_frequency = 0.0f;
+    pat->co_occurrence_strength = 0.0f;
+    
+    /* PHASE 2: Initialize pattern associations */
+    pat->associated_patterns = NULL;
+    pat->association_strengths = NULL;
+    pat->association_count = 0;
+    pat->association_capacity = 0;
+    
+    /* PHASE 3: Initialize learned rules */
+    pat->rule_condition_patterns = NULL;
+    pat->rule_target_patterns = NULL;
+    pat->rule_boost_amounts = NULL;
+    pat->rule_strengths = NULL;
+    pat->rule_count = 0;
+    pat->rule_capacity = 0;
+}
 
 /* ============================================================================
  * SYSTEM STATE: Global statistics for computing ratios
@@ -206,6 +282,12 @@ typedef struct {
     float pattern_confidence;     /* From avg pattern utility (patterns working = trust them) */
     float output_variance;        /* How much do outputs vary? (chaos vs convergence) */
     float avg_pattern_utility;    /* Average success rate of patterns */
+    
+    /* SELF-TUNING: Dynamic adjustments based on performance */
+    float activation_flow_adjustment;  /* Adjust path quality thresholds based on error */
+    float meaning_accumulation_rate;    /* Adjust meaning accumulation speed based on error */
+    float loop_breaking_strength;      /* How aggressively to break loops */
+    float diversity_pressure;          /* Pressure to increase output diversity */
     
     /* Output history for variance and loop detection */
     uint32_t recent_outputs[50];  /* Last 50 output bytes */
@@ -305,6 +387,14 @@ void create_edges_from_coactivation(MelvinGraph *g);
 void create_edges_from_patterns(MelvinGraph *g);
 void create_pattern_edges_from_coactivation(MelvinGraph *g);
 void create_or_strengthen_pattern_edge(MelvinGraph *g, uint32_t from_pattern_id, uint32_t to_pattern_id);
+void update_pattern_context_frequency(MelvinGraph *g);
+void learn_pattern_association(MelvinGraph *g, uint32_t pattern_a_id, uint32_t pattern_b_id);
+void learn_activation_rule(MelvinGraph *g, uint32_t condition_pattern_id, uint32_t target_pattern_id, 
+                          float boost_amount, float success_rate);
+float compute_semantic_distance(MelvinGraph *g, uint32_t pattern_a_id, uint32_t pattern_b_id);
+void propagate_semantic_activation(MelvinGraph *g);
+void actively_generalize_patterns(MelvinGraph *g);
+void explore_pattern_connections(MelvinGraph *g);
 
 /* ============================================================================
  * INITIALIZATION
@@ -388,6 +478,12 @@ MelvinGraph* melvin_create(void) {
     g->state.avg_pattern_utility = 0.5f;
     g->state.output_variance = 1.0f;     /* High variance initially (random) */
     g->state.output_history_index = 0;
+    
+    /* Initialize self-tuning adjustments */
+    g->state.activation_flow_adjustment = 1.0f;
+    g->state.meaning_accumulation_rate = 1.0f;
+    g->state.loop_breaking_strength = 0.0f;
+    g->state.diversity_pressure = 0.0f;
     for (int i = 0; i < 50; i++) {
         g->state.recent_outputs[i] = 0;
     }
@@ -462,6 +558,35 @@ void compute_system_state(MelvinGraph *g) {
     
     /* Exploration pressure from error rate (high error = explore more) */
     g->state.exploration_pressure = g->state.error_rate;
+    
+    /* ========================================================================
+     * SELF-TUNING: Control emergence through feedback loops
+     * 
+     * System detects its own problems and fixes them automatically:
+     * - High error rate → adjust activation flow, slow meaning accumulation
+     * - High loop pressure → break loops aggressively, increase diversity
+     * - Low output variance → stuck → increase exploration
+     * - Wrong outputs → weaken failed paths, strengthen successful ones
+     * ======================================================================== */
+    
+    /* SELF-TUNING: Activation flow control based on error rate */
+    /* High error = activation flowing wrong → be more selective */
+    /* Low error = activation flowing right → keep current settings */
+    g->state.activation_flow_adjustment = 1.0f + (g->state.error_rate * 2.0f);  /* High error = more aggressive filtering */
+    
+    /* SELF-TUNING: Meaning accumulation rate based on error */
+    /* High error = meaning accumulation too fast → slow it down */
+    /* Low error = meaning accumulation working → keep it */
+    g->state.meaning_accumulation_rate = 1.0f - (g->state.error_rate * 0.5f);  /* High error = slower accumulation */
+    
+    /* SELF-TUNING: Loop breaking strength based on loop pressure */
+    /* High loop pressure = stuck in loops → break them aggressively */
+    g->state.loop_breaking_strength = g->state.loop_pressure * 10.0f;  /* Strong loop breaking when needed */
+    
+    /* SELF-TUNING: Output diversity pressure */
+    /* Low variance = stuck in loops → increase diversity */
+    /* High variance = too chaotic → reduce diversity */
+    g->state.diversity_pressure = (1.0f - g->state.output_variance) * g->state.error_rate;  /* Low variance + high error = need diversity */
     
     /* SELF-TUNING FIX 3: Metabolic pressure from graph density */
     /* Too many edges/patterns = high metabolic cost = pressure to prune */
@@ -547,25 +672,49 @@ void update_node_dynamics(MelvinGraph *g, uint32_t node_id) {
     n->activation *= decay_rate;
     
     /* ========================================================================
-     * THRESHOLD ADAPTATION
+     * SELF-REGULATED THRESHOLD ADAPTATION
      * 
-     * threshold adapts to keep activation near average
-     * If too active → increase threshold (less excitable)
-     * If too quiet → decrease threshold (more excitable)
+     * Thresholds adapt based on MEANING/IMPORTANCE, not fixed averages
+     * 
+     * Key insight: "cat" = low importance = low activation = easily handled
+     *              "your girlfriend cheated on you" = high importance = high activation = rings for weeks
+     * 
+     * The system decides what's important based on:
+     * - How often it's used (usage = importance)
+     * - How much activation it receives (high activation = important)
+     * - How well it predicts (successful predictions = important)
+     * 
+     * Thresholds self-regulate to ALLOW important things to stay active
+     * Not force everything to average - let meaning determine activation
      * ======================================================================== */
     
-    float target_activity_ratio = 1.0f; /* Want to be at average */
-    float activity_error = relative_activation - target_activity_ratio;
+    /* IMPORTANCE = learned by the system through experience */
+    /* High usage + high activation + high success = important */
+    float usage_importance = logf(1.0f + n->receive_count) / 10.0f;  /* More usage = more important */
+    float activation_importance = (n->activation > g->state.avg_activation) ? 
+        (n->activation / (g->state.avg_activation + 0.1f)) : 0.5f;  /* High activation = important */
+    float success_importance = (n->receive_count > 0) ? 
+        ((float)n->fire_count / (float)n->receive_count) : 0.5f;  /* High success rate = important */
     
-    /* Adapt threshold proportional to error */
+    /* Combined importance (what the system has learned is important) */
+    float importance = (usage_importance + activation_importance + success_importance) / 3.0f;
+    
+    /* THRESHOLD ADAPTATION: Allow important things to stay active */
+    /* Important things → lower threshold (easier to activate, stay active longer) */
+    /* Unimportant things → higher threshold (harder to activate, decay faster) */
+    float target_threshold = 1.0f - importance;  /* Important = low threshold, unimportant = high threshold */
+    float threshold_error = n->threshold - target_threshold;
+    
+    /* Adapt threshold toward target (self-regulation) */
     float adaptation_rate = 0.01f * g->state.learning_rate;
-    n->threshold += adaptation_rate * activity_error;
+    n->threshold -= adaptation_rate * threshold_error;  /* Move toward target */
     
     /* Threshold naturally bounded [0,1] by sigmoid */
     n->threshold = 1.0f / (1.0f + expf(-5.0f * (n->threshold - 0.5f)));
     
-    /* Activation bounded by threshold (must exceed threshold to be active) */
-    /* No energy constraint - activation is purely local, calculated per node */
+    /* ACTIVATION REFLECTS MEANING: Important things can have high activation */
+    /* Don't force activation to average - let meaning determine it */
+    /* High activation for important things is CORRECT, not a bug */
 }
 
 /* ============================================================================
@@ -614,6 +763,11 @@ float compute_firing_probability(MelvinGraph *g, uint32_t node_id) {
  * ============================================================================ */
 
 void create_or_strengthen_edge(MelvinGraph *g, uint32_t from_id, uint32_t to_id) {
+    /* CRITICAL FIX: Prevent self-loops (root cause of chaotic outputs) */
+    if (from_id == to_id) {
+        return;  /* Never create edge from node to itself */
+    }
+    
     /* PORT-AWARE EDGE CREATION: Only create edges within same port */
     /* Cross-port edges are weaker (prevents modality confusion) */
     uint32_t from_port = g->nodes[from_id].source_port;
@@ -949,10 +1103,14 @@ void propagate_pattern_activation(MelvinGraph *g) {
                     }
                     
                     /* Pattern activation spreads to predicted nodes */
-                    /* BUT: Only if this prediction hasn't been used yet */
+                    /* CRITICAL FIX: Reduce prediction blocking - allow patterns to fire multiple times */
+                    /* Only block if prediction was used in LAST output (not all time) */
                     bool prediction_used = (pat->fired_predictions & (1u << pred)) != 0;
                     
-                    if (target_node < BYTE_VALUES && !prediction_used) {
+                    /* Allow prediction if it hasn't been used OR if enough time has passed */
+                    bool can_predict = !prediction_used || (g->state.step > pat->last_fired_step + 3);
+                    
+                    if (target_node < BYTE_VALUES && can_predict) {
                         /* Track prediction attempts (for utility calculation) */
                         pat->prediction_attempts++;
                         
@@ -972,8 +1130,9 @@ void propagate_pattern_activation(MelvinGraph *g) {
                     }
                 }
                 
-                /* PATTERN-LEVEL PREDICTIONS: Patterns predict other patterns (concept-level reasoning) */
-                /* This is the key to scaling: patterns compose into concepts */
+                /* ========================================================================
+                 * PHASE 1: PATTERN HIERARCHY ACTIVATION WITH MEANING ACCUMULATION
+                 * ======================================================================== */
                 if (pat->pattern_prediction_count > 0) {
                     for (uint32_t ppred = 0; ppred < pat->pattern_prediction_count; ppred++) {
                         uint32_t target_pattern_id = pat->predicted_patterns[ppred];
@@ -982,15 +1141,56 @@ void propagate_pattern_activation(MelvinGraph *g) {
                         Pattern *target_pat = &g->patterns[target_pattern_id];
                         float pattern_pred_weight = pat->pattern_prediction_weights[ppred];
                         
-                        /* Transfer activation from this pattern to predicted pattern */
-                        /* This creates pattern chains: A → B → C = concept formation */
-                        float pattern_transfer = pat->activation * pattern_pred_weight * pat->strength;
+                        /* PHASE 1: Update chain depth (child is one level deeper than parent) */
+                        /* Only update if this is a better parent (closer in chain) */
+                        if (target_pat->parent_pattern_id == INVALID_PATTERN_ID) {
+                            target_pat->parent_pattern_id = p;
+                            target_pat->chain_depth = pat->chain_depth + 1;
+                        } else if (pat->chain_depth < g->patterns[target_pat->parent_pattern_id].chain_depth) {
+                            /* This parent is closer to root - update */
+                            target_pat->parent_pattern_id = p;
+                            target_pat->chain_depth = pat->chain_depth + 1;
+                        }
+                        
+                        /* PHASE 1: Accumulate meaning through chain */
+                        /* CONNECTIONS ARE UNDERSTANDING: When patterns connect, they build meaning */
+                        float parent_meaning = pat->accumulated_meaning;
+                        float chain_meaning = parent_meaning * pattern_pred_weight * pat->strength;
+                        /* If this pattern has no meaning yet, start with its activation */
+                        if (parent_meaning < 0.1f) {
+                            parent_meaning = pat->activation;
+                            chain_meaning = parent_meaning * pattern_pred_weight * pat->strength;
+                        }
+                        
+                        /* CONNECTION BOOST: Patterns that connect to many others have more meaning */
+                        /* This reflects that understanding comes from connections */
+                        float connection_boost = 1.0f + (logf(1.0f + pat->outgoing_patterns.count + pat->association_count) / 5.0f);
+                        chain_meaning *= connection_boost;
+                        
+                        /* HIERARCHY BOOST: Higher in hierarchy = more abstract = more understanding */
+                        /* Deeper patterns (closer to root) represent more abstract concepts */
+                        float hierarchy_boost = 1.0f + (1.0f / (1.0f + pat->chain_depth * 0.3f));
+                        chain_meaning *= hierarchy_boost;
+                        
+                        /* SELF-TUNING: Meaning accumulation rate adjusts based on error */
+                        /* High error = slow accumulation (system is making mistakes) */
+                        /* Low error = fast accumulation (system is working) */
+                        chain_meaning *= g->state.meaning_accumulation_rate;
+                        
+                        target_pat->accumulated_meaning = fmax(target_pat->accumulated_meaning, chain_meaning);
+                        
+                        /* PHASE 1: Meaning multiplier boosts activation for complex concepts */
+                        /* SELF-TUNING: Adjust multiplier based on error rate */
+                        float base_multiplier = 1.0f + (target_pat->accumulated_meaning * 0.5f);
+                        /* High error = reduce meaning boost (system is over-weighting complex concepts) */
+                        float meaning_multiplier = base_multiplier * (1.0f - g->state.error_rate * 0.3f);
+                        
+                        /* Transfer activation with meaning accumulation */
+                        float pattern_transfer = pat->activation * pattern_pred_weight * pat->strength * meaning_multiplier;
                         target_pat->activation += pattern_transfer;
                         
-                        /* Pattern activation bounded by threshold (no energy constraint) */
-                        
-                        /* Pattern predictions are learned associations (like node predictions) */
-                        /* Stronger than edges: direct learned predictions */
+                        /* Cap activation to prevent explosion */
+                        if (target_pat->activation > 10.0f) target_pat->activation = 10.0f;
                     }
                 }
                 
@@ -1015,6 +1215,198 @@ void propagate_pattern_activation(MelvinGraph *g) {
                     out_patterns->edges[pe].use_count++;
                 }
                 
+                /* ========================================================================
+                 * PHASE 2: UPDATE DYNAMIC IMPORTANCE
+                 * ======================================================================== */
+                /* Importance = usage + success + hierarchy + co-occurrence */
+                float usage_importance = logf(1.0f + pat->prediction_attempts) / 10.0f;
+                float success_importance = (pat->prediction_attempts > 0) ? 
+                    ((float)pat->prediction_successes / (float)pat->prediction_attempts) : 0.5f;
+                float hierarchy_importance = 1.0f / (1.0f + pat->chain_depth * 0.5f);  /* Deeper = more abstract = more important */
+                float co_occurrence_importance = pat->co_occurrence_strength;
+                
+                pat->dynamic_importance = (usage_importance + success_importance + 
+                                          hierarchy_importance + co_occurrence_importance) / 4.0f;
+                
+                /* ========================================================================
+                 * SELF-REGULATING: Update pattern rule success rate and confidence
+                 * ======================================================================== */
+                /* Patterns self-regulate their rule behavior based on success */
+                if (pat->rule_attempts > 0) {
+                    pat->rule_success_rate = (float)pat->rule_successes / (float)pat->rule_attempts;
+                }
+                
+                /* Rule confidence = how reliable this pattern's rules are */
+                /* High success rate = high confidence = rules are reliable */
+                /* Start with moderate confidence (0.6) for new patterns, adapt based on success */
+                if (pat->rule_attempts == 0) {
+                    pat->rule_confidence = 0.6f;  /* Start with moderate confidence for new patterns */
+                } else {
+                    pat->rule_confidence = 0.5f + (pat->rule_success_rate - 0.5f) * 2.0f;  /* Map [0,1] to [0,1] */
+                }
+                if (pat->rule_confidence < 0.1f) pat->rule_confidence = 0.1f;
+                if (pat->rule_confidence > 1.0f) pat->rule_confidence = 1.0f;
+                
+                /* Activation control strength = how much this pattern guides the system */
+                /* Successful patterns get more control authority */
+                pat->activation_control_strength = pat->rule_confidence * pat->dynamic_importance;
+                
+                /* Boost/suppression strength adapts based on success */
+                /* Successful patterns boost more, suppress less */
+                /* Increase boost strength to make pattern guidance more effective */
+                pat->boost_strength = pat->rule_confidence * 0.8f;  /* Increased from 0.5f */
+                pat->suppression_strength = (1.0f - pat->rule_confidence) * 0.2f;  /* Reduced from 0.3f */
+                
+                /* PHASE 2: Important patterns get activation boost */
+                /* SELF-TUNING: Adjust boost based on error rate and pattern success */
+                /* High error = reduce importance boost (system is over-weighting wrong patterns) */
+                /* Low error = keep importance boost (system is working) */
+                float importance_boost_base = 1.0f + (pat->dynamic_importance * 2.0f);
+                
+                /* SELF-TUNING: Patterns with low success rate get less boost (they're failing) */
+                float pattern_success_rate = (pat->prediction_attempts > 0) ?
+                    ((float)pat->prediction_successes / (float)pat->prediction_attempts) : 0.5f;
+                float success_adjustment = 0.5f + pattern_success_rate;  /* Failed patterns get 0.5x, successful get 1.0x */
+                
+                float importance_boost = importance_boost_base * (1.0f - g->state.error_rate * 0.4f) * success_adjustment;
+                pat->activation *= importance_boost;
+                
+                /* ========================================================================
+                 * PHASE 2: PATTERN ASSOCIATION NETWORKS
+                 * ======================================================================== */
+                /* When pattern activates, boost associated patterns (co-occurrence) */
+                /* NATURAL SELF-REGULATION: Patterns naturally boost similar patterns */
+                /* High-confidence patterns boost other high-confidence patterns (they "know" together) */
+                /* Low-confidence patterns boost other low-confidence patterns (they're "confused" together) */
+                /* System state emerges from these natural interactions */
+                for (uint32_t assoc = 0; assoc < pat->association_count; assoc++) {
+                    uint32_t assoc_pattern_id = pat->associated_patterns[assoc];
+                    if (assoc_pattern_id >= g->pattern_count) continue;
+                    
+                    Pattern *assoc_pat = &g->patterns[assoc_pattern_id];
+                    float assoc_strength = pat->association_strengths[assoc];
+                    
+                    /* CONFIDENCE SIMILARITY: Similar patterns boost each other more */
+                    float confidence_pat = (pat->prediction_attempts > 0) ?
+                        ((float)pat->prediction_successes / (float)pat->prediction_attempts) : 0.5f;
+                    float confidence_assoc = (assoc_pat->prediction_attempts > 0) ?
+                        ((float)assoc_pat->prediction_successes / (float)assoc_pat->prediction_attempts) : 0.5f;
+                    float confidence_similarity = 1.0f - fabsf(confidence_pat - confidence_assoc);
+                    
+                    /* HIERARCHY SIMILARITY: Patterns at similar hierarchy levels boost each other more */
+                    float hierarchy_similarity = 1.0f / (1.0f + fabsf((float)pat->chain_depth - (float)assoc_pat->chain_depth));
+                    
+                    /* Similarity boost: similar patterns boost each other more strongly */
+                    float similarity_boost = (confidence_similarity * 0.6f + hierarchy_similarity * 0.4f);
+                    
+                    /* Boost associated pattern activation - stronger if similar */
+                    float assoc_activation = pat->activation * assoc_strength * 0.5f * (0.7f + similarity_boost * 0.3f);
+                    assoc_pat->activation += assoc_activation;
+                    if (assoc_pat->activation > 10.0f) assoc_pat->activation = 10.0f;
+                }
+                
+                /* ========================================================================
+                 * PHASE 3: HIERARCHICAL PROPAGATION (Bidirectional)
+                 * ======================================================================== */
+                /* Bottom-up: Boost parent pattern (if exists) */
+                /* HIERARCHY BUILDS UNDERSTANDING: Children contribute meaning to parents */
+                /* Higher in hierarchy = more abstract = more understanding */
+                if (pat->parent_pattern_id != INVALID_PATTERN_ID && pat->parent_pattern_id < g->pattern_count) {
+                    Pattern *parent_pat = &g->patterns[pat->parent_pattern_id];
+                    float child_meaning = pat->accumulated_meaning;
+                    if (child_meaning < 0.1f) child_meaning = pat->activation;
+                    
+                    /* CONNECTION BOOST: Child's connections contribute to parent's understanding */
+                    float child_connections = pat->outgoing_patterns.count + pat->association_count;
+                    float connection_contribution = logf(1.0f + child_connections) / 3.0f;
+                    child_meaning += connection_contribution;
+                    
+                    parent_pat->activation += child_meaning * 0.3f;  /* Boost parent */
+                    parent_pat->accumulated_meaning += child_meaning * 0.2f;
+                    if (parent_pat->activation > 10.0f) parent_pat->activation = 10.0f;
+                }
+                
+                /* Top-down: Boost child patterns (through predictions) */
+                /* This is already handled in pattern predictions above */
+                
+                /* ========================================================================
+                 * PHASE 3: SELF-REGULATING PATTERN RULES (IF-THEN BEHAVIOR)
+                 * ======================================================================== */
+                /* Patterns act as rules: IF condition THEN action */
+                /* Rules self-regulate their strength based on success/failure */
+                for (uint32_t rule = 0; rule < pat->rule_count; rule++) {
+                    uint32_t condition_id = pat->rule_condition_patterns[rule];
+                    if (condition_id >= g->pattern_count) continue;
+                    
+                    Pattern *condition_pat = &g->patterns[condition_id];
+                    bool condition_met = (condition_pat->activation > condition_pat->threshold);
+                    
+                    if (condition_met) {
+                        /* THEN execute action: boost target pattern */
+                        uint32_t target_id = pat->rule_target_patterns[rule];
+                        if (target_id < g->pattern_count) {
+                            Pattern *target_pat = &g->patterns[target_id];
+                            
+                            /* SELF-REGULATING: Rule strength adapts based on success */
+                            /* Successful rules get stronger, failed rules get weaker */
+                            float base_boost = pat->rule_boost_amounts[rule];
+                            float rule_strength = pat->rule_strengths[rule];
+                            
+                            /* Apply rule with self-regulated strength and confidence */
+                            float boost = base_boost * rule_strength * pat->rule_confidence;
+                            target_pat->activation += condition_pat->activation * boost;
+                            if (target_pat->activation > 10.0f) target_pat->activation = 10.0f;
+                            
+                            /* Track rule evaluation (for self-regulation) */
+                            pat->rule_attempts++;
+                        }
+                    }
+                }
+                
+                /* ========================================================================
+                 * PATTERN-GUIDED ACTIVATION CONTROL
+                 * ======================================================================== */
+                /* Patterns guide system by controlling activation flow */
+                /* High control strength = pattern actively guides system behavior */
+                /* Lower threshold to allow more patterns to guide (0.2 instead of 0.3) */
+                if (pat->activation > pat->threshold && pat->activation_control_strength > 0.2f) {
+                    /* Pattern is active and has control authority */
+                    
+                    /* Boost patterns this pattern wants to activate */
+                    if (pat->boost_strength > 0.1f) {
+                        /* Boost associated patterns (patterns this pattern guides) */
+                        for (uint32_t assoc = 0; assoc < pat->association_count; assoc++) {
+                            uint32_t assoc_id = pat->associated_patterns[assoc];
+                            if (assoc_id < g->pattern_count) {
+                                Pattern *assoc_pat = &g->patterns[assoc_id];
+                                float boost = pat->activation * pat->boost_strength * pat->rule_confidence;
+                                assoc_pat->activation += boost;
+                                if (assoc_pat->activation > 10.0f) assoc_pat->activation = 10.0f;
+                            }
+                        }
+                    }
+                    
+                    /* Suppress patterns this pattern wants to suppress */
+                    if (pat->suppression_strength > 0.1f) {
+                        /* Suppress competing patterns (patterns that conflict with this one) */
+                        /* This is learned - patterns learn what to suppress based on failure */
+                        /* For now, suppress patterns with low success rate when this pattern is active */
+                        for (uint32_t p2 = 0; p2 < g->pattern_count; p2++) {
+                            if (p2 == p) continue;  /* Don't suppress self */
+                            Pattern *other_pat = &g->patterns[p2];
+                            if (other_pat->activation > other_pat->threshold) {
+                                float other_success = (other_pat->prediction_attempts > 0) ?
+                                    ((float)other_pat->prediction_successes / (float)other_pat->prediction_attempts) : 0.5f;
+                                /* Suppress patterns with low success when this pattern is active */
+                                if (other_success < 0.3f) {
+                                    float suppression = pat->activation * pat->suppression_strength * pat->rule_confidence;
+                                    other_pat->activation *= (1.0f - suppression);
+                                }
+                            }
+                        }
+                    }
+                }
+                
                 /* Track firing (for utility, not restriction) */
                 pat->last_fired_step = g->state.step;
                 /* Don't set has_fired=true - allow multiple fires per episode */
@@ -1028,6 +1420,191 @@ void propagate_pattern_activation(MelvinGraph *g) {
         /* Decay rate relative to system state */
         float decay_rate = 0.95f * (1.0f - g->state.competition_pressure * 0.1f);
         pat->activation *= decay_rate;
+    }
+}
+
+/* ============================================================================
+ * PHASE 2: LEARN PATTERN ASSOCIATIONS (Co-occurrence)
+ * ============================================================================ */
+
+void learn_pattern_association(MelvinGraph *g, uint32_t pattern_a_id, uint32_t pattern_b_id) {
+    if (pattern_a_id >= g->pattern_count || pattern_b_id >= g->pattern_count) return;
+    if (pattern_a_id == pattern_b_id) return;  /* No self-association */
+    
+    Pattern *pat_a = &g->patterns[pattern_a_id];
+    Pattern *pat_b = &g->patterns[pattern_b_id];
+    
+    /* NATURAL SELF-REGULATION: Patterns connect based on confidence similarity */
+    /* High-confidence patterns naturally connect to other high-confidence patterns (they "know" together) */
+    /* Low-confidence patterns naturally connect to other low-confidence patterns (they're "confused" together) */
+    float confidence_a = (pat_a->prediction_attempts > 0) ?
+        ((float)pat_a->prediction_successes / (float)pat_a->prediction_attempts) : 0.5f;
+    float confidence_b = (pat_b->prediction_attempts > 0) ?
+        ((float)pat_b->prediction_successes / (float)pat_b->prediction_attempts) : 0.5f;
+    
+    /* Confidence similarity: patterns with similar confidence connect more strongly */
+    float confidence_similarity = 1.0f - fabsf(confidence_a - confidence_b);
+    
+    /* HIERARCHY SIMILARITY: Patterns at similar hierarchy levels connect more strongly */
+    /* Higher in hierarchy = more abstract = patterns about patterns = self-understanding */
+    float hierarchy_similarity = 1.0f / (1.0f + fabsf((float)pat_a->chain_depth - (float)pat_b->chain_depth));
+    
+    /* Combined similarity: patterns that are similar in confidence AND hierarchy connect strongly */
+    float similarity_boost = (confidence_similarity * 0.6f + hierarchy_similarity * 0.4f);
+    
+    /* Check if association already exists */
+    bool found = false;
+    for (uint32_t i = 0; i < pat_a->association_count; i++) {
+        if (pat_a->associated_patterns[i] == pattern_b_id) {
+            /* Strengthen existing association - stronger if similar */
+            float base_strength = 0.1f * g->state.learning_rate;
+            pat_a->association_strengths[i] += base_strength * similarity_boost;
+            if (pat_a->association_strengths[i] > 1.0f) pat_a->association_strengths[i] = 1.0f;
+            found = true;
+            break;
+        }
+    }
+    
+    if (!found) {
+        /* Create new association - stronger if similar */
+        if (pat_a->association_count >= pat_a->association_capacity) {
+            pat_a->association_capacity = (pat_a->association_capacity == 0) ? 4 : pat_a->association_capacity * 2;
+            pat_a->associated_patterns = realloc(pat_a->associated_patterns, 
+                                                sizeof(uint32_t) * pat_a->association_capacity);
+            pat_a->association_strengths = realloc(pat_a->association_strengths, 
+                                                   sizeof(float) * pat_a->association_capacity);
+        }
+        
+        pat_a->associated_patterns[pat_a->association_count] = pattern_b_id;
+        pat_a->association_strengths[pat_a->association_count] = 0.1f * g->state.learning_rate * similarity_boost;
+        pat_a->association_count++;
+        
+        /* Update co-occurrence strength - stronger if similar */
+        float co_occurrence_update = 0.1f * similarity_boost;
+        pat_a->co_occurrence_strength = (pat_a->co_occurrence_strength + co_occurrence_update) / 2.0f;
+        pat_b->co_occurrence_strength = (pat_b->co_occurrence_strength + co_occurrence_update) / 2.0f;
+    }
+}
+
+/* ============================================================================
+ * PHASE 3: LEARN ACTIVATION RULES
+ * ============================================================================ */
+
+void learn_activation_rule(MelvinGraph *g, uint32_t condition_pattern_id, uint32_t target_pattern_id, 
+                          float boost_amount, float success_rate) {
+    if (condition_pattern_id >= g->pattern_count || target_pattern_id >= g->pattern_count) return;
+    if (condition_pattern_id == target_pattern_id) return;  /* No self-rule */
+    
+    Pattern *condition_pat = &g->patterns[condition_pattern_id];
+    
+    /* Check if rule already exists */
+    bool found = false;
+    for (uint32_t i = 0; i < condition_pat->rule_count; i++) {
+        if (condition_pat->rule_condition_patterns[i] == condition_pattern_id &&
+            condition_pat->rule_target_patterns[i] == target_pattern_id) {
+            /* Strengthen existing rule */
+            condition_pat->rule_boost_amounts[i] = (condition_pat->rule_boost_amounts[i] + boost_amount) / 2.0f;
+            condition_pat->rule_strengths[i] = (condition_pat->rule_strengths[i] + success_rate) / 2.0f;
+            found = true;
+            break;
+        }
+    }
+    
+    if (!found) {
+        /* Create new rule */
+        if (condition_pat->rule_count >= condition_pat->rule_capacity) {
+            condition_pat->rule_capacity = (condition_pat->rule_capacity == 0) ? 4 : condition_pat->rule_capacity * 2;
+            condition_pat->rule_condition_patterns = realloc(condition_pat->rule_condition_patterns,
+                                                             sizeof(uint32_t) * condition_pat->rule_capacity);
+            condition_pat->rule_target_patterns = realloc(condition_pat->rule_target_patterns,
+                                                          sizeof(uint32_t) * condition_pat->rule_capacity);
+            condition_pat->rule_boost_amounts = realloc(condition_pat->rule_boost_amounts,
+                                                        sizeof(float) * condition_pat->rule_capacity);
+            condition_pat->rule_strengths = realloc(condition_pat->rule_strengths,
+                                                   sizeof(float) * condition_pat->rule_capacity);
+        }
+        
+        condition_pat->rule_condition_patterns[condition_pat->rule_count] = condition_pattern_id;
+        condition_pat->rule_target_patterns[condition_pat->rule_count] = target_pattern_id;
+        condition_pat->rule_boost_amounts[condition_pat->rule_count] = boost_amount;
+        condition_pat->rule_strengths[condition_pat->rule_count] = success_rate;
+        condition_pat->rule_count++;
+        
+        /* SELF-REGULATING: Track rule creation for self-regulation */
+        /* Rules start with moderate confidence, adapt based on success */
+    }
+}
+
+/* ============================================================================
+ * PHASE 3: COMPUTE SEMANTIC DISTANCE
+ * ============================================================================ */
+
+float compute_semantic_distance(MelvinGraph *g, uint32_t pattern_a_id, uint32_t pattern_b_id) {
+    if (pattern_a_id >= g->pattern_count || pattern_b_id >= g->pattern_count) return 1.0f;
+    if (pattern_a_id == pattern_b_id) return 0.0f;
+    
+    Pattern *pat_a = &g->patterns[pattern_a_id];
+    Pattern *pat_b = &g->patterns[pattern_b_id];
+    
+    /* Factor 1: Co-occurrence distance */
+    float co_occurrence_dist = 1.0f;
+    for (uint32_t i = 0; i < pat_a->association_count; i++) {
+        if (pat_a->associated_patterns[i] == pattern_b_id) {
+            co_occurrence_dist = 1.0f - pat_a->association_strengths[i];
+            break;
+        }
+    }
+    
+    /* Factor 2: Shared predictions */
+    float shared_pred_ratio = 0.0f;
+    uint32_t shared_count = 0;
+    uint32_t total_pred = pat_a->prediction_count + pat_b->prediction_count;
+    if (total_pred > 0) {
+        for (uint32_t i = 0; i < pat_a->prediction_count; i++) {
+            for (uint32_t j = 0; j < pat_b->prediction_count; j++) {
+                if (pat_a->predicted_nodes[i] == pat_b->predicted_nodes[j]) {
+                    shared_count++;
+                    break;
+                }
+            }
+        }
+        shared_pred_ratio = (float)shared_count / (float)total_pred;
+    }
+    float shared_pred_dist = 1.0f - shared_pred_ratio;
+    
+    /* Factor 3: Hierarchy distance */
+    float hierarchy_dist = fabs((float)pat_a->chain_depth - (float)pat_b->chain_depth) / 10.0f;
+    if (hierarchy_dist > 1.0f) hierarchy_dist = 1.0f;
+    
+    /* Combined semantic distance */
+    return (co_occurrence_dist + shared_pred_dist + hierarchy_dist) / 3.0f;
+}
+
+/* ============================================================================
+ * PHASE 3: SEMANTIC DISTANCE ACTIVATION
+ * ============================================================================ */
+
+void propagate_semantic_activation(MelvinGraph *g) {
+    /* For each active pattern, boost semantically close patterns */
+    for (uint32_t p = 0; p < g->pattern_count; p++) {
+        Pattern *pat = &g->patterns[p];
+        if (pat->activation < pat->threshold || pat->activation < 0.1f) continue;
+        
+        /* Find semantically close patterns */
+        for (uint32_t q = 0; q < g->pattern_count; q++) {
+            if (p == q) continue;
+            
+            Pattern *other_pat = &g->patterns[q];
+            float distance = compute_semantic_distance(g, p, q);
+            
+            /* Close patterns get activation boost */
+            if (distance < 0.5f) {
+                float distance_factor = 1.0f / (1.0f + distance);
+                float semantic_activation = pat->activation * distance_factor * 0.2f;
+                other_pat->activation += semantic_activation;
+                if (other_pat->activation > 10.0f) other_pat->activation = 10.0f;
+            }
+        }
     }
 }
 
@@ -1105,6 +1682,10 @@ void detect_generalized_patterns(MelvinGraph *g) {
                 pat->predicted_patterns = NULL;
                 pat->pattern_prediction_weights = NULL;
                 pat->pattern_prediction_count = 0;
+                
+                /* Initialize all enhancement fields */
+                initialize_pattern_enhancements(pat);
+                
                 /* Initialize relative to system state */
                 pat->threshold = g->state.avg_threshold;
                 pat->input_weights = NULL;
@@ -1168,6 +1749,351 @@ void detect_generalized_patterns(MelvinGraph *g) {
                 pat->incoming_patterns.capacity = INITIAL_CAPACITY;
                 pat->incoming_patterns.total_weight = 0.0f;
                 pat->incoming_patterns.metabolic_load = 0.0f;
+            }
+        }
+    }
+}
+
+/* ============================================================================
+ * ACTIVE GENERALIZATION: Patterns try to create blank node variants
+ * 
+ * Intelligence: Patterns actively explore connections by trying blank node
+ * substitutions. This is how patterns "try out connections" - they generalize
+ * themselves to see if they can connect to other patterns.
+ * 
+ * Hierarchy builds understanding: When a pattern generalizes, it moves up
+ * the hierarchy (becomes more abstract). Higher = more understanding.
+ * ============================================================================ */
+
+void actively_generalize_patterns(MelvinGraph *g) {
+    if (g->pattern_count == 0) return;
+    
+    /* Only generalize patterns that are active and have some connections */
+    /* But also try patterns with high activation but few connections (they need exploration) */
+    for (uint32_t p = 0; p < g->pattern_count; p++) {
+        Pattern *pat = &g->patterns[p];
+        
+        /* Skip if pattern is too short or too long */
+        if (pat->length < 2 || pat->length > 10) continue;
+        
+        /* Skip if pattern already has many blank nodes (already generalized) */
+        uint32_t blank_count = 0;
+        for (uint32_t i = 0; i < pat->length; i++) {
+            if (pat->node_ids[i] == BLANK_NODE) blank_count++;
+        }
+        if (blank_count >= pat->length / 2) continue;  /* Already too generalized */
+        
+        /* Generalization pressure: based on activation and connection need */
+        float connection_need = 0.0f;
+        if (pat->outgoing_patterns.count < 3 && pat->association_count < 3) {
+            connection_need = 1.0f;  /* Needs more connections */
+        }
+        
+        float generalization_pressure = (pat->activation * 0.5f) + (connection_need * 0.5f);
+        
+        /* Only generalize if pressure is high enough */
+        if (generalization_pressure < 0.3f) continue;
+        
+        /* Try creating blank node variants at each position */
+        for (uint32_t pos = 0; pos < pat->length; pos++) {
+            if (pat->node_ids[pos] == BLANK_NODE) continue;  /* Already blank */
+            
+            /* Create variant with blank at this position */
+            uint32_t variant_length = pat->length;
+            uint32_t *variant_nodes = malloc(sizeof(uint32_t) * variant_length);
+            if (!variant_nodes) continue;
+            
+            for (uint32_t i = 0; i < variant_length; i++) {
+                variant_nodes[i] = (i == pos) ? BLANK_NODE : pat->node_ids[i];
+            }
+            
+            /* Check if this variant already exists */
+            bool variant_exists = false;
+            for (uint32_t q = 0; q < g->pattern_count; q++) {
+                if (q == p) continue;
+                Pattern *other = &g->patterns[q];
+                if (other->length != variant_length) continue;
+                
+                bool matches = true;
+                for (uint32_t i = 0; i < variant_length; i++) {
+                    if (variant_nodes[i] != other->node_ids[i]) {
+                        matches = false;
+                        break;
+                    }
+                }
+                if (matches) {
+                    variant_exists = true;
+                    /* Strengthen existing variant if it matches */
+                    other->strength += 0.05f * generalization_pressure;
+                    if (other->strength > 1.0f) other->strength = 1.0f;
+                    break;
+                }
+            }
+            
+            if (!variant_exists) {
+                /* Check how many patterns this variant would match */
+                uint32_t match_count = 0;
+                for (uint32_t q = 0; q < g->pattern_count; q++) {
+                    if (q == p) continue;
+                    Pattern *other = &g->patterns[q];
+                    if (other->length != variant_length) continue;
+                    
+                    bool matches = true;
+                    for (uint32_t i = 0; i < variant_length; i++) {
+                        if (variant_nodes[i] != BLANK_NODE && 
+                            variant_nodes[i] != other->node_ids[i]) {
+                            matches = false;
+                            break;
+                        }
+                    }
+                    if (matches) match_count++;
+                }
+                
+                /* Only create if it would match at least 2 other patterns */
+                if (match_count >= 2) {
+                    /* Grow pattern array if needed */
+                    if (g->pattern_count >= g->pattern_capacity) {
+                        g->pattern_capacity *= 2;
+                        g->patterns = realloc(g->patterns, sizeof(Pattern) * g->pattern_capacity);
+                    }
+                    
+                    /* Create generalized pattern */
+                    Pattern *generalized = &g->patterns[g->pattern_count++];
+                    generalized->node_ids = variant_nodes;
+                    generalized->length = variant_length;
+                    
+                    /* Initialize fields */
+                    generalized->sub_pattern_ids = NULL;
+                    generalized->sub_pattern_count = 0;
+                    generalized->predicted_nodes = NULL;
+                    generalized->prediction_weights = NULL;
+                    generalized->prediction_count = 0;
+                    generalized->predicted_patterns = NULL;
+                    generalized->pattern_prediction_weights = NULL;
+                    generalized->pattern_prediction_count = 0;
+                    initialize_pattern_enhancements(generalized);
+                    
+                    /* Initialize relative to parent pattern */
+                    generalized->threshold = pat->threshold;
+                    generalized->input_weights = NULL;
+                    generalized->bias = 0.0f;
+                    generalized->input_size = 0;
+                    
+                    /* Strength from generalization: matches multiple patterns = more valuable */
+                    float generalization_benefit = (float)match_count * 0.3f;
+                    generalized->strength = pat->strength * 0.8f + generalization_benefit;
+                    if (generalized->strength > 1.0f) generalized->strength = 1.0f;
+                    generalized->activation = pat->activation * 0.5f;
+                    generalized->prediction_attempts = 0;
+                    generalized->prediction_successes = 0;
+                    generalized->has_fired = false;
+                    generalized->last_fired_step = 0;
+                    generalized->fired_predictions = 0;
+                    
+                    /* Set hierarchy: generalized pattern is parent of original */
+                    generalized->chain_depth = pat->chain_depth;
+                    generalized->parent_pattern_id = pat->parent_pattern_id;
+                    generalized->accumulated_meaning = pat->accumulated_meaning * 1.2f;  /* More abstract = more meaning */
+                    
+                    /* Original pattern becomes child of generalized */
+                    pat->parent_pattern_id = g->pattern_count - 1;
+                    pat->chain_depth = generalized->chain_depth + 1;
+                    
+                    /* Copy port info from parent */
+                    generalized->input_port = pat->input_port;
+                    generalized->output_port = pat->output_port;
+                    
+                    /* Initialize pattern-to-pattern edge lists */
+                    generalized->outgoing_patterns.edges = malloc(sizeof(Edge) * INITIAL_CAPACITY);
+                    generalized->outgoing_patterns.count = 0;
+                    generalized->outgoing_patterns.capacity = INITIAL_CAPACITY;
+                    generalized->outgoing_patterns.total_weight = 0.0f;
+                    generalized->outgoing_patterns.metabolic_load = 0.0f;
+                    
+                    generalized->incoming_patterns.edges = malloc(sizeof(Edge) * INITIAL_CAPACITY);
+                    generalized->incoming_patterns.count = 0;
+                    generalized->incoming_patterns.capacity = INITIAL_CAPACITY;
+                    generalized->incoming_patterns.total_weight = 0.0f;
+                    generalized->incoming_patterns.metabolic_load = 0.0f;
+                    
+                    /* Create edge from generalized to original (parent→child) */
+                    create_or_strengthen_pattern_edge(g, g->pattern_count - 1, p);
+                } else {
+                    free(variant_nodes);
+                }
+            } else {
+                free(variant_nodes);
+            }
+        }
+    }
+}
+
+/* ============================================================================
+ * EXPLORE PATTERN CONNECTIONS: Patterns try blank node substitutions to find connections
+ * 
+ * Intelligence: When a pattern has high activation but few connections, it
+ * tries substituting blank nodes to see if it can match and connect to other patterns.
+ * This is how patterns "try out connections" - active exploration.
+ * ============================================================================ */
+
+void explore_pattern_connections(MelvinGraph *g) {
+    if (g->pattern_count < 2) return;
+    
+    /* Find patterns with high activation but few connections (they need exploration) */
+    for (uint32_t p = 0; p < g->pattern_count; p++) {
+        Pattern *pat = &g->patterns[p];
+        
+        /* Skip if already well-connected */
+        if (pat->outgoing_patterns.count >= 5 && pat->association_count >= 5) continue;
+        
+        /* Skip if activation is too low */
+        if (pat->activation < 0.3f) continue;
+        
+        /* Skip if pattern is too short */
+        if (pat->length < 2) continue;
+        
+        /* Try to find patterns that could connect if we use blank nodes */
+        for (uint32_t q = 0; q < g->pattern_count; q++) {
+            if (q == p) continue;
+            Pattern *other = &g->patterns[q];
+            
+            /* Skip if already connected */
+            bool already_connected = false;
+            for (uint32_t e = 0; e < pat->outgoing_patterns.count; e++) {
+                if (pat->outgoing_patterns.edges[e].to_id == q) {
+                    already_connected = true;
+                    break;
+                }
+            }
+            if (already_connected) continue;
+            
+            /* Check if patterns could match with blank node substitutions */
+            if (pat->length == other->length) {
+                /* Count differences */
+                uint32_t differences = 0;
+                uint32_t diff_positions[10];
+                for (uint32_t i = 0; i < pat->length && differences < 10; i++) {
+                    if (pat->node_ids[i] != other->node_ids[i] &&
+                        pat->node_ids[i] != BLANK_NODE &&
+                        other->node_ids[i] != BLANK_NODE) {
+                        diff_positions[differences++] = i;
+                    }
+                }
+                
+                /* If only 1-2 differences, create a generalized pattern that matches both */
+                if (differences >= 1 && differences <= 2) {
+                    /* Create generalized pattern with blanks at difference positions */
+                    uint32_t *generalized_nodes = malloc(sizeof(uint32_t) * pat->length);
+                    if (!generalized_nodes) continue;
+                    
+                    for (uint32_t i = 0; i < pat->length; i++) {
+                        bool is_diff = false;
+                        for (uint32_t d = 0; d < differences; d++) {
+                            if (diff_positions[d] == i) {
+                                is_diff = true;
+                                break;
+                            }
+                        }
+                        generalized_nodes[i] = is_diff ? BLANK_NODE : pat->node_ids[i];
+                    }
+                    
+                    /* Check if this generalized pattern already exists */
+                    bool exists = false;
+                    for (uint32_t r = 0; r < g->pattern_count; r++) {
+                        Pattern *existing = &g->patterns[r];
+                        if (existing->length != pat->length) continue;
+                        
+                        bool matches = true;
+                        for (uint32_t i = 0; i < pat->length; i++) {
+                            if (generalized_nodes[i] != existing->node_ids[i]) {
+                                matches = false;
+                                break;
+                            }
+                        }
+                        if (matches) {
+                            exists = true;
+                            /* Create connections through existing generalized pattern */
+                            create_or_strengthen_pattern_edge(g, p, r);
+                            create_or_strengthen_pattern_edge(g, r, q);
+                            break;
+                        }
+                    }
+                    
+                    if (!exists) {
+                        /* Create new generalized pattern */
+                        if (g->pattern_count >= g->pattern_capacity) {
+                            g->pattern_capacity *= 2;
+                            g->patterns = realloc(g->patterns, sizeof(Pattern) * g->pattern_capacity);
+                        }
+                        
+                        Pattern *generalized = &g->patterns[g->pattern_count++];
+                        generalized->node_ids = generalized_nodes;
+                        generalized->length = pat->length;
+                        
+                        /* Initialize */
+                        generalized->sub_pattern_ids = NULL;
+                        generalized->sub_pattern_count = 0;
+                        generalized->predicted_nodes = NULL;
+                        generalized->prediction_weights = NULL;
+                        generalized->prediction_count = 0;
+                        generalized->predicted_patterns = NULL;
+                        generalized->pattern_prediction_weights = NULL;
+                        generalized->pattern_prediction_count = 0;
+                        initialize_pattern_enhancements(generalized);
+                        
+                        generalized->threshold = (pat->threshold + other->threshold) / 2.0f;
+                        generalized->input_weights = NULL;
+                        generalized->bias = 0.0f;
+                        generalized->input_size = 0;
+                        
+                        /* Strength from connecting two patterns */
+                        generalized->strength = (pat->strength + other->strength) / 2.0f * 1.2f;
+                        if (generalized->strength > 1.0f) generalized->strength = 1.0f;
+                        generalized->activation = (pat->activation + other->activation) / 2.0f;
+                        generalized->prediction_attempts = 0;
+                        generalized->prediction_successes = 0;
+                        generalized->has_fired = false;
+                        generalized->last_fired_step = 0;
+                        generalized->fired_predictions = 0;
+                        
+                        /* Hierarchy: generalized is parent of both */
+                        generalized->chain_depth = (pat->chain_depth < other->chain_depth) ? pat->chain_depth : other->chain_depth;
+                        generalized->parent_pattern_id = INVALID_PATTERN_ID;
+                        generalized->accumulated_meaning = (pat->accumulated_meaning + other->accumulated_meaning) / 2.0f * 1.3f;
+                        
+                        /* Update parents */
+                        if (pat->parent_pattern_id == INVALID_PATTERN_ID || 
+                            generalized->chain_depth < g->patterns[pat->parent_pattern_id].chain_depth) {
+                            pat->parent_pattern_id = g->pattern_count - 1;
+                            pat->chain_depth = generalized->chain_depth + 1;
+                        }
+                        if (other->parent_pattern_id == INVALID_PATTERN_ID ||
+                            generalized->chain_depth < g->patterns[other->parent_pattern_id].chain_depth) {
+                            other->parent_pattern_id = g->pattern_count - 1;
+                            other->chain_depth = generalized->chain_depth + 1;
+                        }
+                        
+                        generalized->input_port = pat->input_port;
+                        generalized->output_port = pat->output_port;
+                        
+                        /* Initialize edge lists */
+                        generalized->outgoing_patterns.edges = malloc(sizeof(Edge) * INITIAL_CAPACITY);
+                        generalized->outgoing_patterns.count = 0;
+                        generalized->outgoing_patterns.capacity = INITIAL_CAPACITY;
+                        generalized->outgoing_patterns.total_weight = 0.0f;
+                        generalized->outgoing_patterns.metabolic_load = 0.0f;
+                        
+                        generalized->incoming_patterns.edges = malloc(sizeof(Edge) * INITIAL_CAPACITY);
+                        generalized->incoming_patterns.count = 0;
+                        generalized->incoming_patterns.capacity = INITIAL_CAPACITY;
+                        generalized->incoming_patterns.total_weight = 0.0f;
+                        generalized->incoming_patterns.metabolic_load = 0.0f;
+                        
+                        /* Create connections: p → generalized → q */
+                        create_or_strengthen_pattern_edge(g, p, g->pattern_count - 1);
+                        create_or_strengthen_pattern_edge(g, g->pattern_count - 1, q);
+                    }
+                }
             }
         }
     }
@@ -1312,14 +2238,48 @@ void propagate_activation(MelvinGraph *g) {
              * FACTOR 4: Predictive_Power
              * How well does this path predict correct outputs?
              * ======================================================================== */
+            /* ========================================================================
+             * INTELLIGENT ACTIVATION: Pattern hierarchy and meaning guide flow
+             * ======================================================================== */
             float pattern_prediction = 0.3f;  /* Default: not predicted */
+            float pattern_meaning_boost = 1.0f;  /* Default: no meaning boost */
+            float hierarchy_boost = 1.0f;  /* Default: no hierarchy boost */
+            
+            /* Check if this edge is part of an active pattern */
             for (uint32_t p = 0; p < g->pattern_count; p++) {
                 Pattern *pat = &g->patterns[p];
                 if (pat->activation > pat->threshold && pat->activation > 0.1f) {
+                    /* Pattern is active - check if it predicts this target */
                     for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
                         if (pat->predicted_nodes[pred] == target) {
                             /* Pattern confidence = activation × strength */
                             pattern_prediction = pat->activation * pat->strength;
+                            
+                            /* INTELLIGENT ACTIVATION: Meaning and hierarchy boost */
+                            /* Patterns with accumulated meaning carry more information */
+                            pattern_meaning_boost = 1.0f + (pat->accumulated_meaning * 2.0f);
+                            if (pattern_meaning_boost > 5.0f) pattern_meaning_boost = 5.0f;
+                            
+                            /* INTELLIGENT ACTIVATION: Hierarchy depth matters */
+                            /* Deeper patterns (more abstract) = more meaningful */
+                            hierarchy_boost = 1.0f + (pat->chain_depth * 0.3f);
+                            if (hierarchy_boost > 3.0f) hierarchy_boost = 3.0f;
+                            
+                            break;
+                        }
+                    }
+                    
+                    /* Check if this edge (i → target) is part of the pattern sequence */
+                    /* If pattern contains this edge sequence, boost activation flow */
+                    for (uint32_t pat_idx = 0; pat_idx < pat->length - 1; pat_idx++) {
+                        if (pat->node_ids[pat_idx] == i && 
+                            pat->node_ids[pat_idx + 1] == target) {
+                            /* This edge is part of an active pattern! */
+                            /* INTELLIGENT ACTIVATION: Rich pattern connections boost flow */
+                            float pattern_edge_boost = pat->activation * pat->strength * 
+                                                      pat->dynamic_importance * 
+                                                      pattern_meaning_boost * hierarchy_boost;
+                            pattern_prediction = fmax(pattern_prediction, pattern_edge_boost);
                             break;
                         }
                     }
@@ -1329,19 +2289,76 @@ void propagate_activation(MelvinGraph *g) {
             float historical_accuracy = success_rate;  /* From learning strength */
             float context_prediction = context_match;  /* From information */
             
-            float predictive = pattern_prediction * (0.5f + historical_accuracy) * context_prediction;
+            /* INTELLIGENT ACTIVATION: Apply meaning and hierarchy boosts */
+            float predictive = pattern_prediction * pattern_meaning_boost * hierarchy_boost * 
+                             (0.5f + historical_accuracy) * context_prediction;
             
             /* ========================================================================
-             * COMBINE: Path Quality = Information × Learning × Coherence × Predictive
-             * Well-defined measure: all factors must be good for high quality
+             * SELF-REGULATED PATH QUALITY: Importance determines quality
+             * 
+             * Path quality reflects MEANING/IMPORTANCE (learned by system)
+             * Not fixed formulas - the system decides what's important
+             * 
+             * Important paths (high usage, high success, high activation) = high quality
+             * Unimportant paths = low quality
+             * 
+             * The system self-regulates: learns what's important through experience
              * ======================================================================== */
-            path_qualities[j] = information * learning * coherence * predictive;
+            
+            /* IMPORTANCE = what the system has learned is important */
+            /* High usage, high success, high weight = important path */
+            float usage_importance = logf(1.0f + edge->use_count) / 10.0f;  /* More usage = more important */
+            float path_importance = (usage_importance + success_rate + edge_weight) / 3.0f;
+            
+            /* Path quality = base factors × importance (self-regulated) */
+            /* Important paths get higher quality, but activation should flow even if quality is low */
+            /* Use additive combination so activation flows even when factors are low */
+            float base_quality = (information * 0.25f + learning * 0.25f + 
+                                 coherence * 0.25f + predictive * 0.25f);
+            
+            /* Boost for important paths (multiplicative bonus, not requirement) */
+            float importance_boost = (0.5f + path_importance);
+            base_quality *= importance_boost;
+            
+            /* INTELLIGENT ACTIVATION: Rich pattern connections boost path quality */
+            /* If this edge is part of active patterns with meaning, boost quality */
+            float pattern_connection_boost = 1.0f;
+            for (uint32_t p = 0; p < g->pattern_count; p++) {
+                Pattern *pat = &g->patterns[p];
+                if (pat->activation > pat->threshold && pat->activation > 0.1f) {
+                    /* Check if edge is in pattern sequence */
+                    for (uint32_t pat_idx = 0; pat_idx < pat->length - 1; pat_idx++) {
+                        if (pat->node_ids[pat_idx] == i && 
+                            pat->node_ids[pat_idx + 1] == target) {
+                            /* Edge is part of active pattern - boost based on pattern's meaning */
+                            float pattern_boost = 1.0f + (pat->accumulated_meaning * 3.0f) + 
+                                                 (pat->dynamic_importance * 2.0f);
+                            pattern_connection_boost = fmax(pattern_connection_boost, pattern_boost);
+                            break;
+                        }
+                    }
+                }
+            }
+            if (pattern_connection_boost > 10.0f) pattern_connection_boost = 10.0f;
+            
+            /* SELF-TUNING: Adjust path quality based on error rate and activation flow */
+            /* High error = paths are wrong → reduce quality (be more selective) */
+            /* Low error = paths are right → keep quality */
+            float quality_adjustment = 1.0f - (g->state.error_rate * 0.5f);  /* High error = lower quality */
+            /* Use system-wide activation flow adjustment */
+            path_qualities[j] = base_quality * (0.5f + path_importance) * pattern_connection_boost * 
+                               quality_adjustment / g->state.activation_flow_adjustment;
             total_path_quality += path_qualities[j];
         }
         
-        /* Normalize path qualities (relative comparison) */
-        /* Stronger paths get proportionally more activation, not just yes/no */
-        float normalization = (total_path_quality > 0.0f) ? (1.0f / total_path_quality) : 1.0f;
+        /* SELF-REGULATED NORMALIZATION: Prevent explosion while allowing importance */
+        /* If total quality is very small, don't explode - use soft normalization */
+        float soft_normalization = (total_path_quality > 0.001f) ? 
+            (1.0f / total_path_quality) : 
+            (1.0f / (total_path_quality + 0.001f));  /* Soft floor prevents explosion */
+        
+        /* Cap normalization to prevent activation explosion */
+        if (soft_normalization > 100.0f) soft_normalization = 100.0f;
         
         /* Second pass: Propagate activation based on path quality (continuous, not binary) */
         for (uint32_t j = 0; j < out->count && j < 256; j++) {
@@ -1358,13 +2375,22 @@ void propagate_activation(MelvinGraph *g) {
             
             /* Transfer activation proportional to path quality (normalized) */
             /* Better paths get more activation, but all paths get some if quality > 0 */
-            float normalized_quality = path_qualities[j] * normalization;
+            float normalized_quality = path_qualities[j] * soft_normalization;
             float transfer = g->nodes[i].activation * normalized_quality;
             
+            /* SELF-REGULATION: Cap transfer to prevent explosion, but allow high activation for important things */
+            if (transfer > 10.0f) transfer = 10.0f;  /* Cap to prevent explosion */
+            
             /* PATH ACCUMULATION: Activation accumulates along paths */
-            /* Multiple steps = activation builds up at end of good paths */
-            /* This creates "brightest light" at end of best learned paths */
+            /* Important paths get more activation - this is CORRECT (meaning determines activation) */
+            /* "your girlfriend cheated on you" SHOULD have high activation - it's important! */
             g->nodes[target].activation += transfer;
+            
+            /* SELF-REGULATION: Cap node activation to prevent unbounded growth */
+            /* But allow high activation for important things (up to reasonable limit) */
+            if (g->nodes[target].activation > 100.0f) {
+                g->nodes[target].activation = 100.0f;  /* Cap to prevent explosion */
+            }
             g->nodes[target].receive_count++;
             out->edges[j].use_count++;
             
@@ -1395,6 +2421,14 @@ void propagate_activation(MelvinGraph *g) {
     /* Patterns are learned intelligence - they activate and boost their predictions */
     /* This happens AFTER edge propagation so patterns can reinforce learned paths */
     propagate_pattern_activation(g);
+    
+    /* PHASE 2: UPDATE CONTEXT FREQUENCY */
+    /* Track how often patterns appear in current context */
+    update_pattern_context_frequency(g);
+    
+    /* PHASE 3: SEMANTIC DISTANCE ACTIVATION */
+    /* Boost semantically close patterns (meaning similarity) */
+    propagate_semantic_activation(g);
     
     /* CREATE EDGES FROM CO-ACTIVATION (Hebbian: fire together, wire together) */
     create_edges_from_coactivation(g);
@@ -1581,6 +2615,13 @@ void learn_pattern_sequences_automatic(MelvinGraph *g) {
                                         pat1->predicted_patterns[pat1->pattern_prediction_count] = p2;
                                         pat1->pattern_prediction_weights[pat1->pattern_prediction_count] = 0.5f;
                                         pat1->pattern_prediction_count++;
+                                        
+                                        /* PHASE 3: Learn activation rule */
+                                        /* If pattern A predicts pattern B successfully, learn rule */
+                                        float success_rate = (pat1->prediction_attempts > 0) ?
+                                            ((float)pat1->prediction_successes / (float)pat1->prediction_attempts) : 0.5f;
+                                        float boost_amount = pat1->pattern_prediction_weights[pat1->pattern_prediction_count - 1];
+                                        learn_activation_rule(g, p1, p2, boost_amount, success_rate);
                                     }
                                     
                                     break;  /* Found match, move to next position */
@@ -1650,6 +2691,33 @@ void create_or_strengthen_pattern_edge(MelvinGraph *g, uint32_t from_pattern_id,
     e->is_pattern_edge = true;
 }
 
+/* ============================================================================
+ * PHASE 2: UPDATE PATTERN CONTEXT FREQUENCY
+ * ============================================================================ */
+
+void update_pattern_context_frequency(MelvinGraph *g) {
+    /* Update context frequency for all patterns based on current input */
+    for (uint32_t p = 0; p < g->pattern_count; p++) {
+        Pattern *pat = &g->patterns[p];
+        
+        /* Check if pattern matches current input */
+        bool matches = false;
+        for (uint32_t pos = 0; pos <= g->input_length - pat->length; pos++) {
+            if (pattern_matches(g, p, g->input_buffer, g->input_length, pos)) {
+                matches = true;
+                break;
+            }
+        }
+        
+        /* Update context frequency (exponential moving average) */
+        if (matches) {
+            pat->context_frequency = pat->context_frequency * 0.9f + 1.0f * 0.1f;
+        } else {
+            pat->context_frequency = pat->context_frequency * 0.9f + 0.0f * 0.1f;
+        }
+    }
+}
+
 void create_pattern_edges_from_coactivation(MelvinGraph *g) {
     /* Find all currently active patterns */
     uint32_t active_patterns[256];  /* Max patterns */
@@ -1663,6 +2731,10 @@ void create_pattern_edges_from_coactivation(MelvinGraph *g) {
     }
     
     /* Create edges between co-active patterns (Hebbian: fire together, wire together) */
+    /* NATURAL SELF-REGULATION: Patterns naturally connect based on similarity */
+    /* This creates clusters: high-confidence patterns connect to high-confidence patterns */
+    /* Low-confidence patterns connect to low-confidence patterns */
+    /* System state emerges from these natural connections */
     for (uint32_t i = 0; i < active_count; i++) {
         for (uint32_t j = i + 1; j < active_count; j++) {
             uint32_t pat_a_id = active_patterns[i];
@@ -1677,12 +2749,35 @@ void create_pattern_edges_from_coactivation(MelvinGraph *g) {
             /* Co-activation strength */
             float coactivation_strength = pat_a->activation * pat_b->activation * port_penalty;
             
+            /* CONFIDENCE SIMILARITY: Patterns with similar confidence connect more strongly */
+            /* High-confidence patterns naturally cluster together (they "know" together) */
+            /* Low-confidence patterns naturally cluster together (they're "confused" together) */
+            float confidence_a = (pat_a->prediction_attempts > 0) ?
+                ((float)pat_a->prediction_successes / (float)pat_a->prediction_attempts) : 0.5f;
+            float confidence_b = (pat_b->prediction_attempts > 0) ?
+                ((float)pat_b->prediction_successes / (float)pat_b->prediction_attempts) : 0.5f;
+            float confidence_similarity = 1.0f - fabsf(confidence_a - confidence_b);
+            
+            /* HIERARCHY SIMILARITY: Patterns at similar hierarchy levels connect more strongly */
+            /* Higher in hierarchy = more abstract = patterns about patterns = self-understanding */
+            float hierarchy_similarity = 1.0f / (1.0f + fabsf((float)pat_a->chain_depth - (float)pat_b->chain_depth));
+            
+            /* Combined similarity boost */
+            float similarity_boost = (confidence_similarity * 0.6f + hierarchy_similarity * 0.4f);
+            coactivation_strength *= (0.5f + similarity_boost * 0.5f);  /* Boost by up to 50% */
+            
             /* Only create if significant co-activation */
             float threshold = 0.05f * g->state.learning_rate;
             if (coactivation_strength > threshold) {
                 /* Create bidirectional edges (patterns influence each other) */
+                /* Similar patterns get stronger edges - natural clustering */
                 create_or_strengthen_pattern_edge(g, pat_a_id, pat_b_id);
                 create_or_strengthen_pattern_edge(g, pat_b_id, pat_a_id);
+                
+                /* PHASE 2: Learn pattern associations (co-occurrence) */
+                /* This will also use similarity boost internally */
+                learn_pattern_association(g, pat_a_id, pat_b_id);
+                learn_pattern_association(g, pat_b_id, pat_a_id);
             }
         }
     }
@@ -1867,6 +2962,10 @@ void detect_patterns(MelvinGraph *g) {
                 pat->predicted_patterns = NULL;
                 pat->pattern_prediction_weights = NULL;
                 pat->pattern_prediction_count = 0;
+                
+                /* Initialize all enhancement fields */
+                initialize_pattern_enhancements(pat);
+                
                 /* Initialize relative to system state */
                 pat->threshold = g->state.avg_threshold;
                 
@@ -2196,7 +3295,10 @@ uint32_t select_output_node(MelvinGraph *g) {
      * ======================================================================== */
     
     float max_activation = 0.0f;
-    uint32_t winner_node = 0;
+    uint32_t winner_node = BYTE_VALUES;  /* Use invalid node ID to detect no selection */
+    
+    /* If no nodes have activation, we can't select anything */
+    /* This is a real problem - activation should exist from input injection */
     
     /* Find node with highest activation (brightest light) */
     /* This light should be at end of intelligent path from wave propagation */
@@ -2258,7 +3360,11 @@ uint32_t select_output_node(MelvinGraph *g) {
         /* FACTOR 2: Learning_Strength (how well-learned is this node?) */
         float node_activation = g->nodes[i].activation;
         float usage = logf(1.0f + g->nodes[i].receive_count) / 10.0f;  /* Log scale, normalized */
-        float learning = node_activation * (1.0f + usage);
+        /* CRITICAL FIX: If node has activation, learning should not be zero */
+        /* Use activation directly if it exists, even if usage is low (early training) */
+        float learning = (node_activation > 0.01f) ? 
+            (node_activation * (1.0f + usage)) : 
+            (usage * 0.1f);  /* Fallback: use usage even without activation */
         
         /* FACTOR 3: Coherence (does this node fit contextually?) */
         float pattern_alignment = context_match;  /* Same as context_match */
@@ -2284,20 +3390,124 @@ uint32_t select_output_node(MelvinGraph *g) {
         float context_prediction = context_match;
         float predictive = pattern_prediction * (0.5f + historical_accuracy) * context_prediction;
         
-        /* COMBINE: Node Quality = Information × Learning × Coherence × Predictive */
-        /* Well-defined measure: all factors must be good for high quality */
-        float score = information * learning * coherence * predictive;
+        /* COMBINE: Node Quality = Activation (primary) + Relative Bonuses (modifiers) */
+        /* Everything is RELATIVE to system state - no arbitrary constants */
+        /* Intelligence emerges from how this node compares to the system average */
+        float score = node_activation;  /* Start with activation as base */
         
-        /* Skip nodes with negligible quality (relative to system) */
-        float min_quality = g->state.avg_activation * 0.01f;  /* Very low threshold - let quality measure decide */
-        if (score < min_quality) continue;
+        /* RELATIVE INFORMATION: How well-connected is this node compared to average? */
+        /* Compute average connectivity in system (for comparison) */
+        float avg_connectivity = 0.0f;
+        uint32_t connected_nodes = 0;
+        for (int j = 0; j < BYTE_VALUES; j++) {
+            if (!g->nodes[j].exists) continue;
+            EdgeList *out = &g->outgoing[j];
+            if (out->count > 0) {
+                avg_connectivity += (float)out->count;
+                connected_nodes++;
+            }
+        }
+        if (connected_nodes > 0) {
+            avg_connectivity /= connected_nodes;
+        }
         
-        /* Apply loop pressure (suppress recent repeats to prevent stuck loops) */
-        if (g->state.loop_pressure > 0.5f && g->output_length > 2) {
+        /* This node's connectivity relative to average */
+        EdgeList *node_out = &g->outgoing[i];
+        float node_connectivity = (float)node_out->count;
+        float relative_connectivity = (avg_connectivity > 0.0f) ? 
+            (node_connectivity / avg_connectivity) : 1.0f;
+        
+        /* RELATIVE INFORMATION: How well-connected is this node compared to average? */
+        /* Compute average connectivity in system (for comparison) */
+        float avg_connectivity = 0.0f;
+        uint32_t connected_nodes = 0;
+        for (int j = 0; j < BYTE_VALUES; j++) {
+            if (!g->nodes[j].exists) continue;
+            EdgeList *out = &g->outgoing[j];
+            if (out->count > 0) {
+                avg_connectivity += (float)out->count;
+                connected_nodes++;
+            }
+        }
+        if (connected_nodes > 0) {
+            avg_connectivity /= connected_nodes;
+        }
+        
+        /* This node's connectivity relative to average */
+        EdgeList *node_out = &g->outgoing[i];
+        float node_connectivity = (float)node_out->count;
+        float relative_connectivity = (avg_connectivity > 0.0f) ? 
+            (node_connectivity / avg_connectivity) : 1.0f;
+        
+        /* Information is relative to connectivity - well-connected nodes carry more information */
+        float relative_info = information * relative_connectivity;
+        
+        /* RELATIVE LEARNING: How well-learned is this node compared to average? */
+        /* Average usage in system */
+        float avg_usage = 0.0f;
+        uint32_t used_nodes = 0;
+        for (int j = 0; j < BYTE_VALUES; j++) {
+            if (!g->nodes[j].exists || g->nodes[j].receive_count == 0) continue;
+            avg_usage += logf(1.0f + g->nodes[j].receive_count) / 10.0f;
+            used_nodes++;
+        }
+        if (used_nodes > 0) {
+            avg_usage /= used_nodes;
+        }
+        
+        /* This node's usage relative to average */
+        float relative_usage = (avg_usage > 0.0f) ? (usage / avg_usage) : 1.0f;
+        
+        /* RELATIVE COHERENCE: How coherent is this node compared to system? */
+        /* Use pattern confidence as baseline - nodes predicted by patterns are more coherent */
+        float relative_coherence = (g->state.pattern_confidence > 0.0f) ?
+            (coherence / g->state.pattern_confidence) : 1.0f;
+        
+        /* RELATIVE PREDICTIVE: How well-predicted is this node compared to average? */
+        /* Use pattern utility as baseline for what "good prediction" means */
+        float relative_predictive = (g->state.avg_pattern_utility > 0.0f) ?
+            (predictive / g->state.avg_pattern_utility) : 1.0f;
+        
+        /* COMBINE: Score = Activation × Relative Factors */
+        /* All factors are ratios - above 1.0 = better than average, below 1.0 = worse */
+        /* No arbitrary constants - everything is relative to system state */
+        score = node_activation * relative_info * relative_usage * relative_coherence * relative_predictive;
+        
+        /* Ensure score is non-negative (activation is always >= 0) */
+        if (score < 0.0f) score = 0.0f;
+        
+        /* Skip nodes with negligible activation (relative to system) */
+        /* Threshold is relative to system's average activation */
+        float min_activation = g->state.avg_activation * 0.1f;  /* 10% of average */
+        if (node_activation < min_activation && score < min_activation) continue;
+        
+        /* SELF-TUNING: Apply loop breaking based on loop pressure */
+        /* High loop pressure = stuck in loops → break them aggressively */
+        if (g->state.loop_pressure > 0.3f && g->output_length > 2) {
+            float loop_penalty = g->state.loop_breaking_strength;
+            if (loop_penalty < 0.1f) loop_penalty = g->state.loop_pressure * 10.0f;  /* Fallback calculation */
+            
             if (i == g->output_buffer[g->output_length - 1] ||
                 i == g->output_buffer[g->output_length - 2] ||
                 i == g->output_buffer[g->output_length - 3]) {
-                score *= 0.1f;  /* Strongly suppress looping nodes */
+                score *= (1.0f - loop_penalty);  /* Strongly suppress looping nodes */
+                if (score < 0.01f) score = 0.01f;  /* Don't completely kill, just strongly suppress */
+            }
+        }
+        
+        /* SELF-TUNING: Apply diversity pressure (increase output diversity when stuck) */
+        if (g->state.diversity_pressure > 0.3f) {
+            /* Boost nodes that haven't been output recently */
+            bool recently_output = false;
+            uint32_t lookback = (g->output_length > 10) ? 10 : g->output_length;
+            for (uint32_t j = 0; j < lookback; j++) {
+                if (g->output_buffer[g->output_length - 1 - j] == i) {
+                    recently_output = true;
+                    break;
+                }
+            }
+            if (!recently_output) {
+                score *= (1.0f + g->state.diversity_pressure * 2.0f);  /* Boost novel nodes */
             }
         }
         
@@ -2313,6 +3523,31 @@ uint32_t select_output_node(MelvinGraph *g) {
     }
     
     /* Return winner (brightest light at end of intelligent path) */
+    /* If no node passed threshold, it means no nodes have sufficient activation */
+    /* This indicates a problem with activation propagation, not selection */
+    if (winner_node >= BYTE_VALUES) {
+        /* DIAGNOSTIC: Find why no node was selected */
+        /* Check if any nodes have activation at all */
+        float max_act = 0.0f;
+        uint32_t best_node = BYTE_VALUES;
+        for (int i = 0; i < BYTE_VALUES; i++) {
+            if (!g->nodes[i].exists) continue;
+            if (g->nodes[i].activation > max_act) {
+                max_act = g->nodes[i].activation;
+                best_node = i;
+            }
+        }
+        
+        /* If we found a node with any activation, return it */
+        /* The threshold might be too high, but we need to output something */
+        if (best_node < BYTE_VALUES && max_act > 0.0f) {
+            return best_node;
+        }
+        
+        /* No nodes have activation - this is a real problem */
+        /* Should not happen if input injection and propagation work correctly */
+        return BYTE_VALUES;  /* Return invalid to signal problem */
+    }
     return winner_node;
 }
 
@@ -2454,6 +3689,18 @@ void apply_feedback(MelvinGraph *g, const uint8_t *target, uint32_t target_lengt
                                 if (pat->prediction_weights[pred] > 1.0f) {
                                     pat->prediction_weights[pred] = 1.0f;
                                 }
+                                
+                                /* SELF-REGULATING: Successful patterns increase rule confidence */
+                                /* Patterns that succeed get more rule authority */
+                                pat->rule_confidence = fmin(1.0f, pat->rule_confidence + error_share * 0.1f);
+                                pat->rule_successes++;
+                                
+                                /* SELF-REGULATING: Strengthen rule strengths when rules succeed */
+                                /* Rules that lead to success get stronger */
+                                for (uint32_t r = 0; r < pat->rule_count; r++) {
+                                    pat->rule_strengths[r] = fmin(1.0f, pat->rule_strengths[r] + error_share * 0.05f);
+                                }
+                                
                                 break;
                             }
                         }
@@ -2468,6 +3715,7 @@ void apply_feedback(MelvinGraph *g, const uint8_t *target, uint32_t target_lengt
             }
         } else {
             /* INCORRECT prediction - compute error share and weaken contributors */
+            /* SELF-TUNING: Automatically weaken patterns/edges that lead to errors */
             OutputContribution *contrib = &g->output_contributions[i];
             float error_magnitude = 1.0f;  /* Wrong = full error */
             
@@ -2482,7 +3730,7 @@ void apply_feedback(MelvinGraph *g, const uint8_t *target, uint32_t target_lengt
                     float error_share = (contrib->patterns[pc].contribution / 
                                         (contrib->total_contribution + 0.001f)) * error_magnitude;
                     
-                    /* Weaken prediction weights that led to wrong prediction */
+                    /* SELF-TUNING: Weaken prediction weights that led to wrong prediction */
                     for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
                         if (pat->predicted_nodes[pred] == predicted) {
                             pat->prediction_weights[pred] -= 
@@ -2490,6 +3738,28 @@ void apply_feedback(MelvinGraph *g, const uint8_t *target, uint32_t target_lengt
                             if (pat->prediction_weights[pred] < 0.0f) {
                                 pat->prediction_weights[pred] = 0.0f;
                             }
+                            
+                                /* SELF-TUNING: Reduce pattern importance when it leads to errors */
+                                /* Failed patterns become less important automatically */
+                                pat->dynamic_importance *= (1.0f - error_share * 0.1f);
+                                if (pat->dynamic_importance < 0.1f) pat->dynamic_importance = 0.1f;
+                                
+                                /* SELF-TUNING: Reduce accumulated meaning when pattern fails */
+                                /* Failed patterns lose meaning (they don't carry correct information) */
+                                pat->accumulated_meaning *= (1.0f - error_share * 0.2f);
+                                
+                                /* SELF-REGULATING: Reduce rule confidence when pattern fails */
+                                /* Failed patterns lose rule authority (their rules are unreliable) */
+                                pat->rule_confidence *= (1.0f - error_share * 0.15f);
+                                if (pat->rule_confidence < 0.1f) pat->rule_confidence = 0.1f;
+                                
+                                /* SELF-REGULATING: Weaken rule strengths when rules fail */
+                                /* Rules that lead to errors get weaker */
+                                for (uint32_t r = 0; r < pat->rule_count; r++) {
+                                    pat->rule_strengths[r] *= (1.0f - error_share * 0.1f);
+                                    if (pat->rule_strengths[r] < 0.1f) pat->rule_strengths[r] = 0.1f;
+                                }
+                            
                             break;
                         }
                     }
@@ -2671,14 +3941,29 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
     }
     
     /* Propagate activation for several steps */
-    /* Number of steps proportional to input length (not fixed) */
-    uint32_t num_steps = input_len * 3;  /* More steps for better propagation */
-    if (num_steps < 20) num_steps = 20;  /* Minimum steps */
-    if (num_steps > 200) num_steps = 200;  /* Maximum steps */
+    /* OPTIMIZATION: For chat (no target), use fewer steps for speed */
+    /* For training (with target), use more steps for better learning */
+    uint32_t num_steps;
+    if (target == NULL || target_len == 0) {
+        /* Chat mode: Fast response, fewer steps */
+        num_steps = input_len * 2;  /* Faster for chat */
+        if (num_steps < 10) num_steps = 10;  /* Minimum for chat */
+        if (num_steps > 50) num_steps = 50;  /* Cap for speed */
+    } else {
+        /* Training mode: More steps for better learning */
+        num_steps = input_len * 3;
+        if (num_steps < 20) num_steps = 20;
+        if (num_steps > 200) num_steps = 200;
+    }
+    
+    /* Compute system state less frequently for chat mode */
+    uint32_t state_update_interval = (target == NULL || target_len == 0) ? 5 : 1;
     
     for (uint32_t step = 0; step < num_steps; step++) {
-        /* Compute system state each step (for dynamic thresholds) */
-        compute_system_state(g);
+        /* Compute system state periodically (less frequent for chat) */
+        if (step % state_update_interval == 0) {
+            compute_system_state(g);
+        }
         
         /* Propagate */
         propagate_activation(g);
@@ -2686,9 +3971,12 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
         /* Try to output */
         uint32_t output_node = select_output_node(g);
         
-        if (output_node > 0) {
+        /* Check if valid node selected */
+        if (output_node < BYTE_VALUES && g->nodes[output_node].exists) {
             emit_output(g, output_node);
         }
+        /* If output_node >= BYTE_VALUES, no valid node was selected */
+        /* This means no nodes have sufficient activation - propagation problem */
         
         /* Stop if output length matches expected range */
         /* Range is relative to input length */
@@ -2698,20 +3986,42 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
         if (g->output_length >= max_output) {
             break;
         }
+        
+        /* For chat mode, stop early if we have some output */
+        if ((target == NULL || target_len == 0) && g->output_length >= input_len) {
+            break;  /* Got response, stop early */
+        }
     }
     
-    /* Detect patterns in the data we just saw */
-    detect_patterns(g);
-    
-    /* Detect generalized patterns (with blank nodes for generalization) */
-    detect_generalized_patterns(g);
-    
-    /* Learn pattern predictions (what comes after each pattern) */
-    learn_pattern_predictions(g, target, target_len);
-    
-    /* Apply feedback if target provided */
+    /* OPTIMIZATION: Skip expensive pattern detection for chat mode (no target) */
+    /* Only do learning operations when we have a target to learn from */
     if (target != NULL && target_len > 0) {
+        /* Training mode: Do full learning */
+        /* Detect patterns in the data we just saw */
+        detect_patterns(g);
+        
+        /* Detect generalized patterns (with blank nodes for generalization) */
+        detect_generalized_patterns(g);
+        
+        /* ACTIVE GENERALIZATION: Patterns try to create blank node variants to explore connections */
+        /* This is how patterns "try out connections" - they generalize themselves */
+        actively_generalize_patterns(g);
+        
+        /* EXPLORE CONNECTIONS: Patterns try blank node substitutions to find connections */
+        /* Patterns with high activation but few connections actively explore */
+        explore_pattern_connections(g);
+        
+        /* Learn pattern predictions (what comes after each pattern) */
+        learn_pattern_predictions(g, target, target_len);
+        
+        /* Apply feedback */
         apply_feedback(g, target, target_len);
+    } else {
+        /* Chat mode: Skip expensive learning, just respond quickly */
+        /* Only do minimal pattern detection if system is very new */
+        if (g->pattern_count < 10) {
+            detect_patterns(g);  /* Help bootstrap new system */
+        }
     }
 }
 
@@ -2789,6 +4099,13 @@ void learn_pattern_predictions(MelvinGraph *g, const uint8_t *target, uint32_t t
                                         pat1->predicted_patterns[pat1->pattern_prediction_count] = p2;
                                         pat1->pattern_prediction_weights[pat1->pattern_prediction_count] = 0.7f;
                                         pat1->pattern_prediction_count++;
+                                        
+                                        /* PHASE 3: Learn activation rule */
+                                        /* If pattern A predicts pattern B successfully, learn rule */
+                                        float success_rate = (pat1->prediction_attempts > 0) ?
+                                            ((float)pat1->prediction_successes / (float)pat1->prediction_attempts) : 0.5f;
+                                        float boost_amount = pat1->pattern_prediction_weights[pat1->pattern_prediction_count - 1];
+                                        learn_activation_rule(g, p1, p2, boost_amount, success_rate);
                                     }
                                     
                                     /* Normalize pattern prediction weights */
@@ -2807,6 +4124,59 @@ void learn_pattern_predictions(MelvinGraph *g, const uint8_t *target, uint32_t t
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+    
+    /* CRITICAL FIX: Learn input→output mappings */
+    /* When patterns match INPUT, learn to predict TARGET nodes */
+    /* This enables "hello" → "world" learning */
+    for (uint32_t p = 0; p < g->pattern_count; p++) {
+        Pattern *pat = &g->patterns[p];
+        
+        /* Check if pattern matches INPUT (not just target) */
+        if (g->input_length >= pat->length) {
+            for (uint32_t input_pos = 0; input_pos <= g->input_length - pat->length; input_pos++) {
+                if (pattern_matches(g, p, g->input_buffer, g->input_length, input_pos)) {
+                    /* Pattern matches input! Learn to predict TARGET nodes */
+                    if (target_len > 0) {
+                        /* Learn to predict first node of target */
+                        uint32_t target_node = target[0];
+                        
+                        /* Find or add prediction */
+                        bool found = false;
+                        for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
+                            if (pat->predicted_nodes[pred] == target_node) {
+                                /* Strengthen existing prediction */
+                                pat->prediction_weights[pred] += 0.3f * g->state.learning_rate;
+                                if (pat->prediction_weights[pred] > 1.0f) {
+                                    pat->prediction_weights[pred] = 1.0f;
+                                }
+                                found = true;
+                                break;
+                            }
+                        }
+                        
+                        if (!found) {
+                            /* Add new prediction: pattern → target node */
+                            if (pat->prediction_count == 0) {
+                                pat->predicted_nodes = malloc(sizeof(uint32_t) * 4);
+                                pat->prediction_weights = malloc(sizeof(float) * 4);
+                                pat->prediction_count = 0;
+                            } else if (pat->prediction_count % 4 == 0) {
+                                pat->predicted_nodes = realloc(pat->predicted_nodes,
+                                                               sizeof(uint32_t) * (pat->prediction_count + 4));
+                                pat->prediction_weights = realloc(pat->prediction_weights,
+                                                                  sizeof(float) * (pat->prediction_count + 4));
+                            }
+                            
+                            pat->predicted_nodes[pat->prediction_count] = target_node;
+                            pat->prediction_weights[pat->prediction_count] = 0.8f;  /* Strong initial weight */
+                            pat->prediction_count++;
+                        }
+                    }
+                    break;  /* Found match, move to next pattern */
                 }
             }
         }
@@ -3053,6 +4423,13 @@ MelvinGraph* melvin_load_brain(const char *filename) {
             pat->predicted_nodes = NULL;
             pat->prediction_weights = NULL;
             pat->prediction_count = 0;
+            /* Initialize pattern prediction fields (must be initialized to prevent undefined behavior) */
+            pat->predicted_patterns = NULL;
+            pat->pattern_prediction_weights = NULL;
+            pat->pattern_prediction_count = 0;
+            
+            /* Initialize all enhancement fields */
+            initialize_pattern_enhancements(pat);
             if (pred_start) {
                 pred_start += 4;  /* Skip '-> "' */
                 char *pred_end = strchr(pred_start, '"');
