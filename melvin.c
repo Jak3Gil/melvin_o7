@@ -54,6 +54,11 @@ typedef struct {
     float threshold;           /* Firing threshold [0,1] - relative to avg */
     float energy;              /* Available energy [0,1] - proportion of capacity */
     
+    /* TEMPORAL SUMMATION: Accumulate inputs over time window (like neurons) */
+    float *input_history;      /* Recent inputs over time window */
+    uint32_t history_index;    /* Current position in circular buffer */
+    uint32_t history_size;     /* Size of time window (typically 10-20 steps) */
+    
     /* History (for computing derivatives/rates) */
     float prev_activation;     /* Previous step activation */
     float activation_momentum; /* Rate of change (derivative) */
@@ -74,8 +79,14 @@ typedef struct {
 typedef struct {
     uint32_t to_id;            /* Target node or pattern ID */
     
-    /* Weight is proportion of parent node's output */
-    float weight;              /* [0,1] - share of parent's activation */
+    /* Weight can be positive (excitatory) or negative (inhibitory) */
+    /* Normalized: sum of abs(weights) = 1.0 (proportion of parent's output) */
+    float weight;              /* [-1,1] - share of parent's activation (can inhibit) */
+    
+    /* PHASE DELAY: Signal propagation delay (like real neural/fungal networks) */
+    uint32_t delay;            /* Steps before signal arrives (0=instant, 1-10=delayed) */
+    float *delay_buffer;       /* Buffer storing delayed signals */
+    uint32_t delay_index;      /* Current position in delay buffer */
     
     /* Usage tracking (for computing relative importance) */
     uint64_t use_count;        /* Times this edge was traversed */
@@ -208,6 +219,10 @@ typedef struct {
     uint32_t recent_outputs[50];  /* Last 50 output bytes */
     uint32_t output_history_index;
     
+    /* THERMAL NOISE: System-wide temperature (like thermodynamics) */
+    /* Higher temperature = more random fluctuations = more exploration */
+    float temperature;           /* [0,1] - system excitability/noise level */
+    
     /* Time (for computing rates) */
     uint64_t step;             /* Global step counter */
     
@@ -282,7 +297,6 @@ void compute_system_state(MelvinGraph *g);
 void normalize_edge_weights(MelvinGraph *g, uint32_t node_id);
 void update_node_dynamics(MelvinGraph *g, uint32_t node_id);
 float compute_firing_probability(MelvinGraph *g, uint32_t node_id);
-float compute_node_relevance(MelvinGraph *g, uint32_t node_id);
 float melvin_get_edge_weight(MelvinGraph *g, uint32_t from_id, uint32_t to_id);
 void melvin_set_context(MelvinGraph *g, float *context);
 void melvin_set_input_port(MelvinGraph *g, uint32_t port_id);
@@ -322,6 +336,11 @@ MelvinGraph* melvin_create(void) {
         g->nodes[i].fire_count = 0;
         g->nodes[i].receive_count = 0;
         g->nodes[i].source_port = 0;  /* Default port */
+        
+        /* TEMPORAL SUMMATION: Initialize time window buffer (typically 15 steps) */
+        g->nodes[i].history_size = 15;
+        g->nodes[i].input_history = calloc(g->nodes[i].history_size, sizeof(float));
+        g->nodes[i].history_index = 0;
     }
     
     /* Initialize edge lists */
@@ -386,6 +405,7 @@ MelvinGraph* melvin_create(void) {
     g->state.avg_pattern_utility = 0.5f;
     g->state.output_variance = 1.0f;     /* High variance initially (random) */
     g->state.output_history_index = 0;
+    g->state.temperature = 0.1f;         /* Low temperature initially (little noise) */
     for (int i = 0; i < 50; i++) {
         g->state.recent_outputs[i] = 0;
     }
@@ -434,6 +454,18 @@ void compute_system_state(MelvinGraph *g) {
     g->state.total_activation = total_act;
     g->state.active_node_count = active_count;
     
+    /* Compute total edge count (for metabolic pressure calculation) */
+    uint32_t total_edges = 0;
+    for (int i = 0; i < BYTE_VALUES; i++) {
+        EdgeList *out = &g->outgoing[i];
+        for (uint32_t j = 0; j < out->count; j++) {
+            if (out->edges[j].active) {
+                total_edges++;
+            }
+        }
+    }
+    g->state.total_edge_count = total_edges;
+    
     /* Compute activation rate (change from last step) */
     static float prev_total_act = 0.0f;
     g->state.activation_rate = total_act - prev_total_act;
@@ -464,6 +496,10 @@ void compute_system_state(MelvinGraph *g) {
     /* Exploration pressure from error rate (high error = explore more) */
     g->state.exploration_pressure = g->state.error_rate;
     
+    /* THERMAL NOISE: Temperature based on exploration (high exploration = more noise) */
+    /* High error = high exploration = high temperature = more random fluctuations */
+    g->state.temperature = 0.05f + 0.15f * g->state.exploration_pressure;  /* 0.05 to 0.2 */
+    
     /* SELF-TUNING FIX 3: Metabolic pressure from graph density */
     /* Too many edges/patterns = high metabolic cost = pressure to prune */
     float edge_density = (g->state.total_edge_count > 0) ? 
@@ -486,24 +522,25 @@ void compute_system_state(MelvinGraph *g) {
 void normalize_edge_weights(MelvinGraph *g, uint32_t node_id) {
     EdgeList *out = &g->outgoing[node_id];
     
-    /* Compute sum of all weights */
-    float sum = 0.0f;
+    /* INHIBITION: Normalize by sum of absolute values (allows negative weights) */
+    /* Sum of abs(weights) = 1.0 (proportion of parent's output magnitude) */
+    float abs_sum = 0.0f;
     for (uint32_t i = 0; i < out->count; i++) {
         if (out->edges[i].active) {
-            sum += out->edges[i].weight;
+            abs_sum += fabsf(out->edges[i].weight);
         }
     }
     
-    /* Normalize (divide by sum) */
-    if (sum > 0.0f) {
+    /* Normalize (divide by absolute sum, preserving sign) */
+    if (abs_sum > 0.001f) {
         for (uint32_t i = 0; i < out->count; i++) {
             if (out->edges[i].active) {
-                out->edges[i].weight /= sum;
+                out->edges[i].weight /= abs_sum;
             }
         }
     }
     
-    out->total_weight = 1.0f; /* After normalization, always sums to 1 */
+    out->total_weight = abs_sum; /* Sum of absolute weights after normalization */
     
     /* Compute metabolic load (cost is quadratic in edge count) */
     /* Having many edges is expensive - encourages pruning */
@@ -538,6 +575,32 @@ void update_node_dynamics(MelvinGraph *g, uint32_t node_id) {
     
     /* Energy pressure (more energy = push to activate) */
     float energy_pressure = n->energy - n->threshold;
+    
+    /* TEMPORAL SUMMATION: Sum inputs over time window (like neurons) */
+    /* Recent inputs accumulate - rapid weak inputs can still trigger firing */
+    float temporal_sum = 0.0f;
+    if (n->input_history != NULL) {
+        float tau = 5.0f;  /* Time constant for exponential decay of history */
+        for (uint32_t t = 0; t < n->history_size; t++) {
+            uint32_t hist_idx = (n->history_index + n->history_size - t) % n->history_size;
+            float age = (float)t;
+            float weight = expf(-age / tau);  /* More recent = stronger */
+            temporal_sum += n->input_history[hist_idx] * weight;
+        }
+        /* Advance history buffer (circular) */
+        n->history_index = (n->history_index + 1) % n->history_size;
+        n->input_history[(n->history_index + n->history_size - 1) % n->history_size] = 0.0f;  /* Clear oldest */
+    }
+    
+    /* Add temporally summed inputs to activation */
+    n->activation += temporal_sum;
+    
+    /* THERMAL NOISE: Random fluctuations (like thermodynamics) */
+    /* Higher temperature = more noise = more exploration */
+    float noise_scale = g->state.temperature * 0.01f;  /* Scale noise by temperature */
+    float noise = ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f;  /* Random [-1, 1] */
+    noise *= noise_scale * sqrtf(0.01f);  /* Scale by time step */
+    n->activation += noise;
     
     /* Compute activation momentum (derivative) */
     float activation_change = n->activation - n->prev_activation;
@@ -585,8 +648,12 @@ void update_node_dynamics(MelvinGraph *g, uint32_t node_id) {
     n->energy = 1.0f / (1.0f + expf(-5.0f * (n->energy - 0.5f)));
     
     /* Activation is limited by available energy (circular constraint) */
+    /* INHIBITION: Allow negative activation (inhibition) but bound it */
     if (n->activation > n->energy) {
         n->activation = n->energy;
+    }
+    if (n->activation < -0.5f) {  /* Allow inhibition but cap it */
+        n->activation = -0.5f;
     }
 }
 
@@ -668,10 +735,16 @@ void create_or_strengthen_edge(MelvinGraph *g, uint32_t from_id, uint32_t to_id)
     
     Edge *e = &out->edges[out->count];
     e->to_id = to_id;
-    e->weight = 0.01f; /* Start small */
+    e->weight = 0.01f; /* Start small (excitatory by default) */
     e->use_count = 1;
     e->success_count = 0;
     e->active = true;
+    
+    /* PHASE DELAY: Initialize delay buffer (random delay 0-3 steps) */
+    e->delay = (uint32_t)(g->state.step % 4);  /* Vary delays 0-3 */
+    uint32_t buffer_size = e->delay + 1;  /* Need delay+1 slots for circular buffer */
+    e->delay_buffer = calloc(buffer_size, sizeof(float));
+    e->delay_index = 0;
     
     out->count++;
     
@@ -939,6 +1012,12 @@ void propagate_pattern_activation(MelvinGraph *g) {
                         g->nodes[target_node].activation = 0.0f;
                         g->nodes[target_node].energy = 0.5f;
                         g->nodes[target_node].threshold = g->state.avg_threshold;
+                        /* Initialize temporal summation buffer */
+                        if (g->nodes[target_node].input_history == NULL) {
+                            g->nodes[target_node].history_size = 15;
+                            g->nodes[target_node].input_history = calloc(g->nodes[target_node].history_size, sizeof(float));
+                            g->nodes[target_node].history_index = 0;
+                        }
                     }
                     
                     /* Pattern activation spreads to predicted nodes */
@@ -955,10 +1034,16 @@ void propagate_pattern_activation(MelvinGraph *g) {
                         float transfer = pat->activation * weight * pat->strength;
                         
                         /* Apply same exploration bonus as edges get */
-                        float exploration_bonus = 1.0f + g->state.exploration_pressure * (1.0f - weight);
+                        float exploration_bonus = 1.0f + g->state.exploration_pressure * (1.0f - fabsf(weight));
                         transfer *= exploration_bonus;
                         
-                        g->nodes[target_node].activation += transfer;
+                        /* TEMPORAL SUMMATION: Add to input history (patterns also use temporal integration) */
+                        if (g->nodes[target_node].exists && g->nodes[target_node].input_history != NULL) {
+                            uint32_t hist_idx = g->nodes[target_node].history_index;
+                            g->nodes[target_node].input_history[hist_idx] += transfer;
+                        } else {
+                            g->nodes[target_node].activation += transfer;
+                        }
                         g->nodes[target_node].receive_count++;
                     }
                 }
@@ -1146,6 +1231,25 @@ void detect_generalized_patterns(MelvinGraph *g) {
  * 
  * Propagate activation through edges AND patterns (micro neural nets)
  * Competition emerges from firing probabilities (not hardcoded winner-take-all)
+ * 
+ * ACTIVATION SOURCES (what creates activation):
+ * 1. Input injection: Direct activation from input bytes (0.5-1.0)
+ * 2. Edge propagation: activation += source_activation * edge_weight (can be negative for inhibition)
+ * 3. Pattern boosting: activation += pattern_activation * prediction_weight * pattern_strength
+ * 4. Co-activation: Nodes active together create NEW edges (Hebbian learning)
+ * 
+ * NEW FEATURES (inspired by biology/physics/fungi):
+ * - TEMPORAL SUMMATION: Inputs accumulate over ~15 step time window (like neurons)
+ * - INHIBITION: Negative weights allow destructive interference (like inhibitory neurons)
+ * - PHASE DELAYS: Signals propagate with 0-3 step delays (like wave propagation)
+ * - THERMAL NOISE: Random fluctuations based on temperature (exploration)
+ * 
+ * HIGH ACTIVATION comes from:
+ * - Multiple converging paths (many edges/patterns → same node)
+ * - Strong learned weights (high edge weights, high pattern strength)
+ * - High energy (activation bounded by energy: activation ≤ energy)
+ * - Low decay rate (activation decays at ~0.9 per step, slower during competition)
+ * - Temporal accumulation (rapid weak inputs can still trigger firing)
  * ============================================================================ */
 
 void propagate_activation(MelvinGraph *g) {
@@ -1171,16 +1275,55 @@ void propagate_activation(MelvinGraph *g) {
                 g->nodes[target].activation = 0.0f;
                 g->nodes[target].energy = 0.5f;
                 g->nodes[target].threshold = g->state.avg_threshold;
+                /* Initialize temporal summation buffer if not already allocated */
+                if (g->nodes[target].input_history == NULL) {
+                    g->nodes[target].history_size = 15;
+                    g->nodes[target].input_history = calloc(g->nodes[target].history_size, sizeof(float));
+                    g->nodes[target].history_index = 0;
+                }
             }
             
-            /* Transfer activation (proportional to weight and source activation) */
+            /* Compute transfer (can be negative for inhibition) */
             float transfer = g->nodes[i].activation * weight;
             
             /* Apply exploration bonus (weak edges get boost during exploration) */
-            float exploration_bonus = 1.0f + g->state.exploration_pressure * (1.0f - weight);
+            float exploration_bonus = 1.0f + g->state.exploration_pressure * (1.0f - fabsf(weight));
             transfer *= exploration_bonus;
             
-            g->nodes[target].activation += transfer;
+            /* PHASE DELAY: Store signal in delay buffer (signals arrive at different times) */
+            Edge *edge = &out->edges[j];
+            Node *target_node = &g->nodes[target];
+            
+            if (edge->delay_buffer != NULL && edge->delay > 0) {
+                /* Store current signal in delay buffer (will arrive after delay steps) */
+                uint32_t buffer_size = edge->delay + 1;
+                edge->delay_buffer[edge->delay_index] = transfer;
+                
+                /* Retrieve signal that's ready NOW (stored delay steps ago) */
+                uint32_t ready_idx = (edge->delay_index + buffer_size - edge->delay) % buffer_size;
+                float delayed_transfer = edge->delay_buffer[ready_idx];
+                edge->delay_buffer[ready_idx] = 0.0f;  /* Clear after retrieval */
+                
+                /* Advance delay buffer index (circular) */
+                edge->delay_index = (edge->delay_index + 1) % buffer_size;
+                
+                /* TEMPORAL SUMMATION: Add delayed signal to input history */
+                if (target_node->input_history != NULL) {
+                    uint32_t hist_idx = target_node->history_index;
+                    target_node->input_history[hist_idx] += delayed_transfer;
+                } else {
+                    target_node->activation += delayed_transfer;
+                }
+            } else {
+                /* No delay - immediate transfer (TEMPORAL SUMMATION: add to history) */
+                if (target_node->input_history != NULL) {
+                    uint32_t hist_idx = target_node->history_index;
+                    target_node->input_history[hist_idx] += transfer;
+                } else {
+                    target_node->activation += transfer;
+                }
+            }
+            
             g->nodes[target].receive_count++;
             out->edges[j].use_count++;
             
@@ -1368,6 +1511,12 @@ void create_or_strengthen_pattern_edge(MelvinGraph *g, uint32_t from_pattern_id,
     e->success_count = 0;
     e->active = true;
     e->is_pattern_edge = true;
+    
+    /* PHASE DELAY: Initialize delay buffer for pattern edges too */
+    e->delay = (uint32_t)(g->state.step % 4);
+    uint32_t buffer_size = e->delay + 1;
+    e->delay_buffer = calloc(buffer_size, sizeof(float));
+    e->delay_index = 0;
 }
 
 void create_pattern_edges_from_coactivation(MelvinGraph *g) {
@@ -1453,6 +1602,12 @@ void inject_input_from_port(MelvinGraph *g, const uint8_t *bytes, uint32_t lengt
             g->nodes[byte].threshold = g->state.avg_threshold;
             /* AUTO-LEARNED PORT: Node learns its port from injection */
             g->nodes[byte].source_port = port_id;
+            /* Initialize temporal summation buffer */
+            if (g->nodes[byte].input_history == NULL) {
+                g->nodes[byte].history_size = 15;
+                g->nodes[byte].input_history = calloc(g->nodes[byte].history_size, sizeof(float));
+                g->nodes[byte].history_index = 0;
+            }
         } else {
             /* Existing node: port might change if reused across modalities */
             /* Keep original port (first port it was seen with) */
@@ -1463,11 +1618,16 @@ void inject_input_from_port(MelvinGraph *g, const uint8_t *bytes, uint32_t lengt
         /* High exploration = stronger injection (force attention) */
         float injection_strength = 0.5f + 0.5f * g->state.exploration_pressure;
         
-        /* Add activation (bounded by energy) */
-        g->nodes[byte].activation += injection_strength;
-        if (g->nodes[byte].activation > g->nodes[byte].energy) {
-            g->nodes[byte].activation = g->nodes[byte].energy;
+        /* TEMPORAL SUMMATION: Add to input history (inputs accumulate over time) */
+        if (g->nodes[byte].input_history != NULL) {
+            uint32_t hist_idx = g->nodes[byte].history_index;
+            g->nodes[byte].input_history[hist_idx] += injection_strength;
+        } else {
+            /* Fallback: immediate addition if no history buffer */
+            g->nodes[byte].activation += injection_strength;
         }
+        
+        /* Activation bounded by energy (handled in node dynamics) */
         
         /* Create sequential edges (Hebbian: this byte followed that byte) */
         if (i > 0) {
@@ -1760,8 +1920,16 @@ void detect_patterns(MelvinGraph *g) {
 /* ============================================================================
  * 3. OUTPUT SELECTION
  * 
- * Select next output node based on firing probabilities
- * No winner-take-all threshold - probabilistic sampling
+ * WINNER-TAKE-ALL: Select node with highest activation
+ * 
+ * Intelligence comes from WAVE PROPAGATION:
+ * - Edges transfer activation proportional to WEIGHTS (learned associations)
+ * - Patterns boost predictions proportional to STRENGTH (learned utility)
+ * - Wave propagation already weighted everything intelligently
+ * - Highest activation naturally wins (biology does this)
+ * 
+ * The intelligence is in HOW activation flows through weighted edges and patterns,
+ * not in complex selection logic.
  * ============================================================================ */
 
 /* ============================================================================
@@ -1774,166 +1942,63 @@ void detect_patterns(MelvinGraph *g) {
  * 4. Sequential coherence (does this follow from previous output?)
  * 
  * Returns relevance score [0,1]
+ * contrib_out: Optional pointer to store contribution tracking info
  * ============================================================================ */
 
-float compute_node_relevance(MelvinGraph *g, uint32_t node_id) {
+/* ============================================================================
+ * COMPUTE NODE ACTIVATION SCORE
+ * 
+ * Intelligence comes from wave propagation:
+ * - Edges transfer activation proportional to weights (already done in propagate_activation)
+ * - Patterns boost predictions proportional to strength (already done in propagate_pattern_activation)
+ * - Winner-take-all: highest activation wins
+ * ============================================================================ */
+
+float compute_node_activation_score(MelvinGraph *g, uint32_t node_id) {
     Node *n = &g->nodes[node_id];
     if (!n->exists) return 0.0f;
     
-    /* ========================================================================
-     * INTELLIGENCE: Context determines what fires, not just static weights
-     * ======================================================================== */
+    /* Base score: actual wave activation (already weighted by edges/patterns) */
+    /* This is the REAL activation from wave propagation - intelligence is already baked in */
+    float score = n->activation;
     
-    /* CONTEXT 1: Where are we in the sequence? (Position in output) */
-    /* Output position determines what makes sense - not just "highest weight" */
-    float position_context = 0.0f;
-    
-    /* Check if output sequence matches any pattern's INPUT part */
-    /* If pattern matches current output, its PREDICTIONS are contextually relevant */
-    for (uint32_t p = 0; p < g->pattern_count; p++) {
-        Pattern *pat = &g->patterns[p];
-        
-        /* Does pattern match END of current output? */
-        if (g->output_length >= pat->length && pat->prediction_count > 0) {
-            uint32_t start_pos = g->output_length - pat->length;
-            if (pattern_matches(g, p, g->output_buffer, g->output_length, start_pos)) {
-                /* Pattern matches! Check if it predicts THIS node */
-                for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
-                    if (pat->predicted_nodes[pred] == node_id) {
-                        /* This node is contextually relevant (pattern says "this should come next") */
-                        /* Weight by pattern strength AND prediction confidence */
-                        position_context += pat->strength * pat->prediction_weights[pred];
-                    }
-                }
-            }
+    /* Apply loop pressure (suppress recent repeats) */
+    if (g->state.loop_pressure > 0.5f && g->output_length > 2) {
+        if (node_id == g->output_buffer[g->output_length - 1] ||
+            node_id == g->output_buffer[g->output_length - 2] ||
+            node_id == g->output_buffer[g->output_length - 3]) {
+            score *= 0.1f;  /* Strongly suppress looping nodes */
         }
     }
     
-    /* CONTEXT 2: Where did we come from? (Activation history) */
-    /* Nodes that were recently active are LESS likely to repeat (avoid loops) */
-    float history_penalty = 0.0f;
-    for (uint32_t i = 0; i < g->output_length; i++) {
-        if (g->output_buffer[i] == node_id) {
-            /* Node already appeared - penalize based on recency */
-            float recency = (float)(g->output_length - i) / (g->output_length + 1.0f);
-            history_penalty += recency * 0.5f;  /* Recent repetition = strong penalty */
-        }
+    /* Slight history penalty (avoid immediate repetition) */
+    if (g->output_length > 0 && node_id == g->output_buffer[g->output_length - 1]) {
+        score *= 0.3f;  /* Don't repeat immediately */
     }
-    if (history_penalty > 0.9f) history_penalty = 0.9f;  /* Cap penalty */
     
-    /* CONTEXT 3: Current wave activation (what's hot right now) */
-    /* Activation represents the CURRENT state of wave propagation */
-    float wave_activation = n->activation / (n->energy + 0.001f);  /* Proportion of available energy */
-    
-    /* CONTEXT 4: Input context (what's the task?) */
-    /* Nodes from input are more likely to be relevant */
-    float input_context = 0.0f;
-    for (uint32_t i = 0; i < g->input_length; i++) {
-        if (g->input_buffer[i] == node_id) {
-            input_context += 0.3f;
-        }
-    }
-    if (input_context > 1.0f) input_context = 1.0f;
-    
-    /* ========================================================================
-     * COMPUTE LIVE RELEVANCE: No static weights, all dynamic context
-     * ======================================================================== */
-    
-    /* SELF-TUNING FIX 6: Pattern confidence drives output selection */
-    /* When patterns work well (high confidence), trust them over wave chaos */
-    float pattern_weight = g->state.pattern_confidence;
-    float wave_weight = 1.0f - pattern_weight;
-    
-    /* If node has strong position context (patterns predict it), prioritize it */
-    if (position_context > 0.1f) {
-        /* Pattern-driven selection (INTELLIGENT) - boost when patterns are confident */
-        float pattern_relevance = position_context * (1.0f - history_penalty) * (1.0f + wave_activation);
-        float wave_relevance = wave_activation * (1.0f - history_penalty) * (1.0f + input_context * 0.5f);
-        
-        /* Weight by pattern confidence */
-        float relevance = (pattern_weight * pattern_relevance) + (wave_weight * wave_relevance);
-        
-        /* If patterns are confident, boost their predictions */
-        if (pattern_weight > 0.7f) {
-            relevance *= 2.0f;  /* Strong boost when patterns are reliable */
-        }
-        
-        /* Apply loop pressure - suppress nodes that continue loops */
-        if (g->state.loop_pressure > 0.5f && g->output_length > 0) {
-            if (node_id == g->output_buffer[g->output_length - 3]) {
-                relevance *= 0.1f;  /* Kill looping nodes */
-            }
-        }
-        
-        return relevance;
-    } else {
-        /* Activation-driven selection (fallback when no pattern matches) */
-        /* Use wave activation, moderated by history and input context */
-        float relevance = wave_activation * (1.0f - history_penalty) * (1.0f + input_context * 0.5f);
-        
-        /* Apply loop pressure */
-        if (g->state.loop_pressure > 0.5f && g->output_length > 0) {
-            if (node_id == g->output_buffer[g->output_length - 3]) {
-                relevance *= 0.1f;  /* Kill looping nodes */
-            }
-        }
-        
-        return relevance;
-    }
+    return score;
 }
 
 uint32_t select_output_node(MelvinGraph *g) {
-    /* Compute relevance scores for all nodes (multi-factor, like attention) */
-    float relevance_scores[BYTE_VALUES];
-    float total_relevance = 0.0f;
+    /* WINNER-TAKE-ALL: Pick node with highest activation */
+    /* Intelligence comes from wave propagation - edges and patterns already weighted activation */
     
-    for (int i = 0; i < BYTE_VALUES; i++) {
-        if (!g->nodes[i].exists) {
-            relevance_scores[i] = 0.0f;
-            continue;
-        }
-        
-        /* Multi-factor relevance score */
-        relevance_scores[i] = compute_node_relevance(g, i);
-        total_relevance += relevance_scores[i];
-    }
-    
-    /* No nodes relevant? Return 0 */
-    if (total_relevance < 0.001f) {
-        return 0;
-    }
-    
-    /* Normalize to probabilities */
-    for (int i = 0; i < BYTE_VALUES; i++) {
-        relevance_scores[i] /= total_relevance;
-    }
-    
-    /* SELECTION STRATEGY: Temperature-based (exploration vs exploitation) */
-    /* High temperature = explore (consider multiple options) */
-    /* Low temperature = exploit (pick best) */
-    float temperature = 0.5f + 0.5f * g->state.exploration_pressure;  /* 0.5 to 1.0 */
-    
-    /* Apply temperature: raise probabilities to power (1/temperature) */
-    /* Higher temperature = flatter distribution (more exploration) */
-    /* Lower temperature = sharper distribution (more exploitation) */
-    float max_score = 0.0f;
+    float max_activation = 0.0f;
     uint32_t best_node = 0;
     
     for (int i = 0; i < BYTE_VALUES; i++) {
-        if (relevance_scores[i] > 0.0f) {
-            /* Temperature scaling: score^(1/temp) */
-            float scaled = powf(relevance_scores[i], 1.0f / temperature);
-            relevance_scores[i] = scaled;
-            
-            if (scaled > max_score) {
-                max_score = scaled;
-                best_node = i;
-            }
+        if (!g->nodes[i].exists) continue;
+        
+        float score = compute_node_activation_score(g, i);
+        
+        if (score > max_activation) {
+            max_activation = score;
+            best_node = i;
         }
     }
     
-    /* Only return if relevance is above threshold */
-    if (max_score > 0.01f) {
+    /* Only return if activation is meaningful */
+    if (max_activation > 0.001f) {
         return best_node;
     }
     
@@ -2044,164 +2109,14 @@ void emit_output(MelvinGraph *g, uint32_t node_id) {
  * ============================================================================ */
 
 void apply_feedback(MelvinGraph *g, const uint8_t *target, uint32_t target_length) {
-    /* Compare output to target */
-    uint32_t correct = 0;
-    uint32_t min_len = (g->output_length < target_length) ? g->output_length : target_length;
-    
-    /* RICH ERROR SIGNAL: Compute positional error and attribute to components */
-    for (uint32_t i = 0; i < min_len; i++) {
-        uint32_t predicted = g->output_buffer[i];
-        uint32_t expected = target[i];
-        
-        if (predicted == expected) {
-            correct++;
-            
-            /* Correct prediction - strengthen contributing components */
-            OutputContribution *contrib = &g->output_contributions[i];
-            
-            /* Strengthen patterns that contributed correctly */
-            for (uint32_t pc = 0; pc < contrib->pattern_count; pc++) {
-                if (contrib->patterns[pc].predicted == predicted) {
-                    uint32_t p = contrib->patterns[pc].pattern_id;
-                    if (p < g->pattern_count) {
-                        Pattern *pat = &g->patterns[p];
-                        pat->prediction_successes++;
-                        
-                        /* Strengthen prediction weight for this node */
-                        for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
-                            if (pat->predicted_nodes[pred] == predicted) {
-                                float error_share = contrib->patterns[pc].contribution / 
-                                                   (contrib->total_contribution + 0.001f);
-                                pat->prediction_weights[pred] += 
-                                    g->state.learning_rate * error_share * 0.5f;
-                                if (pat->prediction_weights[pred] > 1.0f) {
-                                    pat->prediction_weights[pred] = 1.0f;
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            
-            /* Strengthen edges that contributed correctly */
-            for (uint32_t ec = 0; ec < contrib->edge_count; ec++) {
-                uint32_t from = contrib->edges[ec].from_node;
-                create_or_strengthen_edge(g, from, predicted);
-            }
-        } else {
-            /* INCORRECT prediction - compute error share and weaken contributors */
-            OutputContribution *contrib = &g->output_contributions[i];
-            float error_magnitude = 1.0f;  /* Wrong = full error */
-            
-            /* Weaken patterns that contributed incorrectly */
-            for (uint32_t pc = 0; pc < contrib->pattern_count; pc++) {
-                uint32_t p = contrib->patterns[pc].pattern_id;
-                if (p < g->pattern_count) {
-                    Pattern *pat = &g->patterns[p];
-                    pat->prediction_attempts++;
-                    
-                    /* Error share = (pattern contribution / total) × error */
-                    float error_share = (contrib->patterns[pc].contribution / 
-                                        (contrib->total_contribution + 0.001f)) * error_magnitude;
-                    
-                    /* Weaken prediction weights that led to wrong prediction */
-                    for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
-                        if (pat->predicted_nodes[pred] == predicted) {
-                            pat->prediction_weights[pred] -= 
-                                g->state.learning_rate * error_share * 0.3f;
-                            if (pat->prediction_weights[pred] < 0.0f) {
-                                pat->prediction_weights[pred] = 0.0f;
-                            }
-                            break;
-                        }
-                    }
-                    
-                    /* If pattern predicted wrong node, learn to predict correct one instead */
-                    bool has_correct_prediction = false;
-                    for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
-                        if (pat->predicted_nodes[pred] == expected) {
-                            has_correct_prediction = true;
-                            /* Strengthen this prediction */
-                            pat->prediction_weights[pred] += 
-                                g->state.learning_rate * error_share * 0.2f;
-                            if (pat->prediction_weights[pred] > 1.0f) {
-                                pat->prediction_weights[pred] = 1.0f;
-                            }
-                            break;
-                        }
-                    }
-                    
-                    /* If pattern doesn't predict correct node, add it */
-                    if (!has_correct_prediction && contrib->patterns[pc].contribution > 0.1f) {
-                        /* Add new prediction */
-                        if (pat->prediction_count == 0) {
-                            pat->predicted_nodes = malloc(sizeof(uint32_t) * 4);
-                            pat->prediction_weights = malloc(sizeof(float) * 4);
-                            pat->prediction_count = 0;
-                        } else if (pat->prediction_count % 4 == 0) {
-                            pat->predicted_nodes = realloc(pat->predicted_nodes,
-                                                           sizeof(uint32_t) * (pat->prediction_count + 4));
-                            pat->prediction_weights = realloc(pat->prediction_weights,
-                                                             sizeof(float) * (pat->prediction_count + 4));
-                        }
-                        pat->predicted_nodes[pat->prediction_count] = expected;
-                        pat->prediction_weights[pat->prediction_count] = 
-                            g->state.learning_rate * error_share;
-                        pat->prediction_count++;
-                    }
-                }
-            }
-        }
-    }
-    
-    /* Compute error rate */
-    float accuracy = (target_length > 0) ? (float)correct / target_length : 0.0f;
-    float current_error = 1.0f - accuracy;
-    
-    /* Update system error rate (smoothed) */
-    float smoothing = 0.9f;
-    g->state.error_rate = smoothing * g->state.error_rate + (1.0f - smoothing) * current_error;
-    
-    /* Learning rate adapts to error (high error = learn faster) */
-    /* SELF-TUNING: Learning rate already computed in compute_system_state() */
-    /* It's based on learning_pressure = error_rate² (quadratic feedback) */
-    /* learning_rate = 0.5 * learning_pressure (already set in compute_system_state) */
-    
-    /* Strengthen sequential edges in target (correct path) */
+    /* Strengthen sequential edges in target sequence */
+    /* Learning comes from exposure to correct paths */
     for (uint32_t i = 0; i < target_length - 1; i++) {
         create_or_strengthen_edge(g, target[i], target[i + 1]);
     }
     
-    /* Pattern backpropagation (preserves neural net learning) */
-    /* This still runs to maintain pattern hierarchy and internal weight updates */
-    for (uint32_t p = 0; p < g->pattern_count; p++) {
-        Pattern *pat = &g->patterns[p];
-        
-        if (pat->activation > 0.0f && g->input_length >= pat->length) {
-            /* Compute pattern error from contribution history */
-            float pattern_error = 0.0f;
-            bool pattern_contributed = false;
-            
-            for (uint32_t i = 0; i < min_len; i++) {
-                OutputContribution *contrib = &g->output_contributions[i];
-                for (uint32_t pc = 0; pc < contrib->pattern_count; pc++) {
-                    if (contrib->patterns[pc].pattern_id == p) {
-                        pattern_contributed = true;
-                        if (g->output_buffer[i] != target[i]) {
-                            pattern_error += contrib->patterns[pc].contribution / 
-                                            (contrib->total_contribution + 0.001f);
-                        }
-                    }
-                }
-            }
-            
-            if (pattern_contributed && pattern_error > 0.0f) {
-                uint32_t *input_nodes = &g->input_buffer[g->input_length - pat->length];
-                pattern_backprop(g, p, pattern_error, input_nodes, pat->length);
-            }
-        }
-    }
+    /* Patterns learn predictions from target sequence (handled in learn_pattern_predictions) */
+    /* This function mainly just strengthens the target path edges */
 }
 
 /* ============================================================================
@@ -2755,7 +2670,7 @@ MelvinGraph* melvin_load_brain(const char *filename) {
 void melvin_destroy(MelvinGraph *g) {
     if (!g) return;
     
-    /* Free pattern memory */
+    /* Free pattern memory and pattern edge delay buffers */
     for (uint32_t p = 0; p < g->pattern_count; p++) {
         Pattern *pat = &g->patterns[p];
         if (pat->node_ids) free(pat->node_ids);
@@ -2763,15 +2678,54 @@ void melvin_destroy(MelvinGraph *g) {
         if (pat->predicted_nodes) free(pat->predicted_nodes);
         if (pat->prediction_weights) free(pat->prediction_weights);
         if (pat->input_weights) free(pat->input_weights);
-        if (pat->outgoing_patterns.edges) free(pat->outgoing_patterns.edges);
-        if (pat->incoming_patterns.edges) free(pat->incoming_patterns.edges);
+        
+        /* Free pattern edge delay buffers */
+        EdgeList *out_pat = &pat->outgoing_patterns;
+        if (out_pat->edges) {
+            for (uint32_t e = 0; e < out_pat->count; e++) {
+                if (out_pat->edges[e].delay_buffer) {
+                    free(out_pat->edges[e].delay_buffer);
+                }
+            }
+            free(out_pat->edges);
+        }
+        EdgeList *in_pat = &pat->incoming_patterns;
+        if (in_pat->edges) {
+            for (uint32_t e = 0; e < in_pat->count; e++) {
+                if (in_pat->edges[e].delay_buffer) {
+                    free(in_pat->edges[e].delay_buffer);
+                }
+            }
+            free(in_pat->edges);
+        }
     }
     if (g->patterns) free(g->patterns);
     
-    /* Free edge lists */
+    /* Free edge lists and delay buffers */
     for (int i = 0; i < BYTE_VALUES; i++) {
-        if (g->outgoing[i].edges) free(g->outgoing[i].edges);
-        if (g->incoming[i].edges) free(g->incoming[i].edges);
+        EdgeList *out = &g->outgoing[i];
+        if (out->edges) {
+            for (uint32_t e = 0; e < out->count; e++) {
+                if (out->edges[e].delay_buffer) {
+                    free(out->edges[e].delay_buffer);
+                }
+            }
+            free(out->edges);
+        }
+        EdgeList *in = &g->incoming[i];
+        if (in->edges) {
+            for (uint32_t e = 0; e < in->count; e++) {
+                if (in->edges[e].delay_buffer) {
+                    free(in->edges[e].delay_buffer);
+                }
+            }
+            free(in->edges);
+        }
+        
+        /* Free node temporal summation buffers */
+        if (g->nodes[i].input_history) {
+            free(g->nodes[i].input_history);
+        }
     }
     
     /* Free buffers */
