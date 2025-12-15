@@ -28,6 +28,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <errno.h>
 
 /* Include melvin */
 typedef struct MelvinGraph MelvinGraph;
@@ -42,7 +43,9 @@ extern float melvin_get_error_rate(MelvinGraph *g);
 static MelvinGraph *g_melvin = NULL;
 
 /* HTTP Server Configuration */
+#ifndef PORT
 #define PORT 8080
+#endif
 #define BUFFER_SIZE 8192
 #define MAX_PATH_LENGTH 256
 

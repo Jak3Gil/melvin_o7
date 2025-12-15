@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  melvin:
+    build: .
+    ports:
+      - "8080:8080"
+    container_name: melvin_chat
+    restart: unless-stopped
+    volumes:
+      # Optional: mount a volume to persist brain state
+      # - ./brains:/app/brains
+    environment:
+      - PORT=8080
