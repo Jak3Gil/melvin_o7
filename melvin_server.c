@@ -43,11 +43,21 @@ extern float melvin_get_error_rate(MelvinGraph *g);
 static MelvinGraph *g_melvin = NULL;
 
 /* HTTP Server Configuration */
-#ifndef PORT
-#define PORT 8080
-#endif
+#define DEFAULT_PORT 8080
 #define BUFFER_SIZE 8192
 #define MAX_PATH_LENGTH 256
+
+/* Get port from environment or use default */
+static int get_port(void) {
+    const char *port_str = getenv("PORT");
+    if (port_str) {
+        int port = atoi(port_str);
+        if (port > 0 && port < 65536) {
+            return port;
+        }
+    }
+    return DEFAULT_PORT;
+}
 
 /* HTTP Response Helpers */
 void send_response(SOCKET client, int status, const char *status_text, 
@@ -426,12 +436,15 @@ int main(void) {
     setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 #endif
     
+    /* Get port from environment (Railway sets this) */
+    int port = get_port();
+    
     /* Bind socket */
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(PORT);
+    server_addr.sin_port = htons(port);
     
     if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
         fprintf(stderr, "Bind failed: %d\n", SOCKET_ERROR_CODE);
@@ -450,9 +463,8 @@ int main(void) {
         return 1;
     }
     
-    printf("Server listening on http://localhost:%d\n", PORT);
-    printf("Open your browser and navigate to the URL above\n");
-    printf("Press Ctrl+C to stop the server\n\n");
+    printf("Server listening on port %d\n", port);
+    printf("Melvin is ready to chat!\n\n");
     
     /* Main loop */
     while (1) {
