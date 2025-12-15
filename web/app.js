@@ -1,4 +1,4 @@
-// Chat application for Melvin (WebAssembly version)
+// Chat application for Melvin (HTTP API version)
 
 const messagesContainer = document.getElementById('messages');
 const messageInput = document.getElementById('messageInput');
@@ -7,11 +7,6 @@ const statusSpan = document.getElementById('status');
 const errorRateSpan = document.getElementById('errorRate');
 
 let isLoading = false;
-let melvinModule = null;
-let melvinProcess = null;
-let melvinGetError = null;
-let melvinInit = null;
-let melvinFree = null;
 
 // Add message to chat
 function addMessage(text, isUser) {
@@ -58,43 +53,11 @@ function updateErrorRate(errorRate) {
     }
 }
 
-// Initialize WebAssembly module
-async function initMelvin() {
-    try {
-        updateStatus('Loading Melvin...');
-        
-        // Load the WebAssembly module
-        melvinModule = await Module();
-        
-        // Get function wrappers
-        melvinInit = melvinModule.cwrap('melvin_init', 'number', []);
-        melvinProcess = melvinModule.cwrap('melvin_process_message', 'string', ['string']);
-        melvinGetError = melvinModule.cwrap('melvin_get_error', 'number', []);
-        melvinFree = melvinModule.cwrap('melvin_free_string', null, ['string']);
-        
-        // Initialize Melvin
-        const result = melvinInit();
-        if (result === 0) {
-            throw new Error('Failed to initialize Melvin');
-        }
-        
-        updateStatus('Ready');
-        updateErrorRate(melvinGetError());
-        
-        console.log('Melvin WebAssembly loaded successfully');
-        
-    } catch (error) {
-        console.error('Failed to load Melvin:', error);
-        updateStatus('Failed to load Melvin', true);
-        addMessage('Error: Failed to initialize Melvin. Please refresh the page.', false);
-    }
-}
-
-// Send message to Melvin
-function sendMessage() {
+// Send message to Melvin via HTTP API
+async function sendMessage() {
     const message = messageInput.value.trim();
     
-    if (!message || isLoading || !melvinProcess) {
+    if (!message || isLoading) {
         return;
     }
     
@@ -106,26 +69,35 @@ function sendMessage() {
     isLoading = true;
     messageInput.disabled = true;
     sendButton.disabled = true;
-    updateStatus('Processing...');
+    updateStatus('Sending...');
     
     try {
-        // Process message through Melvin
-        const response = melvinProcess(message);
+        // Send to API
+        const response = await fetch('/api/chat', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ message: message })
+        });
+        
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({ error: 'Unknown error' }));
+            throw new Error(errorData.error || `HTTP ${response.status}`);
+        }
+        
+        const data = await response.json();
         
         // Add Melvin's response
-        if (response) {
-            addMessage(response, false);
-            // Free the string returned by WebAssembly
-            if (melvinFree) {
-                melvinFree(response);
-            }
+        if (data.response) {
+            addMessage(data.response, false);
         } else {
             addMessage('(No response)', false);
         }
         
         // Update error rate
-        if (melvinGetError) {
-            updateErrorRate(melvinGetError());
+        if (data.error_rate !== undefined) {
+            updateErrorRate(data.error_rate);
         }
         
         updateStatus('Ready');
@@ -151,11 +123,27 @@ messageInput.addEventListener('keypress', (e) => {
     }
 });
 
-// Initialize on page load
-window.addEventListener('load', () => {
-    messageInput.focus();
-    initMelvin();
-});
+// Check server status on load
+async function checkStatus() {
+    try {
+        const response = await fetch('/api/status');
+        if (response.ok) {
+            const data = await response.json();
+            updateStatus('Connected');
+            if (data.error_rate !== undefined) {
+                updateErrorRate(data.error_rate);
+            }
+        } else {
+            updateStatus('Server error', true);
+        }
+    } catch (error) {
+        updateStatus('Cannot connect to server', true);
+    }
+}
+
+// Initialize
+messageInput.focus();
+checkStatus();
 
 // Auto-focus input when clicking anywhere in chat
 messagesContainer.addEventListener('click', () => {
