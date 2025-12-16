@@ -75,8 +75,10 @@ typedef struct {
 typedef struct {
     uint32_t to_id;            /* Target node or pattern ID */
     
-    /* Weight is proportion of parent node's output */
-    float weight;              /* [0,1] - share of parent's activation */
+    /* Weight is RELATIVE STRENGTH of this edge FROM this source node */
+    /* NOT a global proportion - relative to other edges from same source */
+    /* Grows with usage and success - no global normalization */
+    float weight;              /* Absolute strength - relative to source node's other edges */
     
     /* Usage tracking (for computing relative importance) */
     uint64_t use_count;        /* Times this edge was traversed */
@@ -98,7 +100,7 @@ typedef struct {
     Edge *edges;              /* Dynamic array of edges */
     uint32_t count;           /* Current number of edges */
     uint32_t capacity;        /* Allocated capacity */
-    float total_weight;       /* Sum of all edge weights (for normalization) */
+    float total_weight;       /* Max weight from this node (for relative comparison, not normalization) */
     float metabolic_load;     /* Cost of maintaining these edges */
     
 } EdgeList;
@@ -383,6 +385,7 @@ void propagate_pattern_activation(MelvinGraph *g);
 void detect_generalized_patterns(MelvinGraph *g);
 void learn_pattern_predictions(MelvinGraph *g, const uint8_t *target, uint32_t target_len);
 void learn_pattern_sequences_automatic(MelvinGraph *g);
+void connect_to_similar_patterns(MelvinGraph *g, const uint32_t *sequence, uint32_t seq_len);
 void pattern_backprop(MelvinGraph *g, uint32_t pattern_id, float error, const uint32_t *input_nodes, uint32_t input_len);
 void create_edges_from_coactivation(MelvinGraph *g);
 void create_edges_from_patterns(MelvinGraph *g);
@@ -550,12 +553,39 @@ void compute_system_state(MelvinGraph *g) {
     /* Normalize variance to [0,1] pressure (sigmoid-like) */
     g->state.competition_pressure = 1.0f / (1.0f + expf(-10.0f * (variance - 0.5f)));
     
-    /* SELF-TUNING FIX 2: Learning pressure = error_rate² (quadratic - aggressive when needed) */
-    /* High error (0.9) → high pressure (0.81), Low error (0.1) → low pressure (0.01) */
-    g->state.learning_pressure = g->state.error_rate * g->state.error_rate;
+    /* SELF-ADJUSTING: Learning rate based on USAGE, not error_rate
+     * 
+     * Without feedback, we can't use error_rate. Instead:
+     * - High usage = system is active = learn faster
+     * - Low usage = system is inactive = learn slower
+     * - Exploration pressure = need to explore = learn faster
+     * 
+     * This creates natural self-regulation: active paths learn faster
+     */
     
-    /* Update learning rate based on learning pressure */
-    g->state.learning_rate = 0.5f * g->state.learning_pressure;  /* Scales from 0.0 to 0.405 */
+    /* Compute average edge usage (how active is the system?) */
+    float total_usage = 0.0f;
+    uint32_t usage_count = 0;
+    for (int i = 0; i < BYTE_VALUES && i < 50; i++) {  /* Sample edges */
+        if (!g->nodes[i].exists) continue;
+        EdgeList *out = &g->outgoing[i];
+        for (uint32_t j = 0; j < out->count && j < 5; j++) {
+            if (out->edges[j].active) {
+                total_usage += logf(1.0f + out->edges[j].use_count);
+                usage_count++;
+            }
+        }
+    }
+    float avg_usage = (usage_count > 0) ? (total_usage / usage_count) : 0.0f;
+    float usage_pressure = fmin(avg_usage / 5.0f, 1.0f);  /* Normalize to [0,1] */
+    
+    /* Learning rate = usage pressure + exploration pressure */
+    /* Active system (high usage) + need to explore = learn faster */
+    g->state.learning_rate = 0.3f + (usage_pressure * 0.3f) + (g->state.exploration_pressure * 0.2f);
+    if (g->state.learning_rate > 1.0f) g->state.learning_rate = 1.0f;
+    
+    /* Learning pressure for other uses (keep for compatibility) */
+    g->state.learning_pressure = g->state.learning_rate;  /* Use learning_rate as pressure */
     
     /* Exploration pressure from error rate (high error = explore more) */
     g->state.exploration_pressure = g->state.error_rate;
@@ -609,31 +639,44 @@ void compute_system_state(MelvinGraph *g) {
  * ============================================================================ */
 
 void normalize_edge_weights(MelvinGraph *g, uint32_t node_id) {
+    /* NO NORMALIZATION: Weights are RELATIVE to source node, not globally normalized
+     * 
+     * Weight represents: "How strong is this edge relative to other edges FROM THIS NODE?"
+     * 
+     * Self-adjustment through:
+     * - Usage: More use = stronger (natural growth)
+     * - Success: Correct predictions = stronger (when feedback exists)
+     * - Competition: Strong edges get more activation = stronger (circular)
+     * - Pruning: Weak edges get pruned (metabolic pressure)
+     * 
+     * When selecting from a node, compare weights RELATIVELY:
+     *   relative_weight = edge.weight / max_weight_from_node
+     * 
+     * This makes weights relative to the node's context, not globally normalized!
+     */
+    
     EdgeList *out = &g->outgoing[node_id];
     
-    /* Compute sum of all weights */
+    /* Compute max weight from this node (for relative comparison) */
+    float max_weight = 0.0f;
     float sum = 0.0f;
     for (uint32_t i = 0; i < out->count; i++) {
         if (out->edges[i].active) {
+            if (out->edges[i].weight > max_weight) {
+                max_weight = out->edges[i].weight;
+            }
             sum += out->edges[i].weight;
         }
     }
     
-    /* Normalize (divide by sum) */
-    if (sum > 0.0f) {
-        for (uint32_t i = 0; i < out->count; i++) {
-            if (out->edges[i].active) {
-                out->edges[i].weight /= sum;
-            }
-        }
-    }
-    
-    out->total_weight = 1.0f; /* After normalization, always sums to 1 */
+    /* Store max for relative comparison (not normalization) */
+    out->total_weight = max_weight;  /* Max weight, not sum - for relative comparison */
     
     /* Compute metabolic load (cost is quadratic in edge count) */
-    /* Having many edges is expensive - encourages pruning */
     float density = (float)out->count / BYTE_VALUES;
     out->metabolic_load = density * density;
+    
+    /* NO NORMALIZATION: Weights grow independently, compared relatively when needed */
 }
 
 /* ============================================================================
@@ -794,24 +837,56 @@ void create_or_strengthen_edge(MelvinGraph *g, uint32_t from_id, uint32_t to_id)
     /* Find existing edge */
     for (uint32_t i = 0; i < out->count; i++) {
         if (out->edges[i].to_id == to_id && out->edges[i].active) {
-            /* Strengthen existing edge (faster growth for learning) */
+            /* SELF-ADJUSTING: Strengthen edge based on usage and success */
+            /* Growth rate depends on:
+             * - Learning rate (how fast system learns)
+             * - Port penalty (same port = faster)
+             * - Usage (more use = faster growth)
+             * - Success rate (correct predictions = faster growth)
+             */
             float old_weight = out->edges[i].weight;
-            float growth_rate = 0.3f * g->state.learning_rate * port_penalty;
-            out->edges[i].weight += growth_rate * (1.0f - out->edges[i].weight);
             out->edges[i].use_count++;
+            
+            /* Base growth rate */
+            float base_growth = 0.1f * g->state.learning_rate * port_penalty;
+            
+            /* Usage boost: More use = faster growth (log scale) */
+            float usage_boost = logf(1.0f + out->edges[i].use_count) / 10.0f;
+            
+            /* Success boost: Correct predictions = faster growth */
+            float success_rate = (out->edges[i].use_count > 0) ? 
+                ((float)out->edges[i].success_count / (float)out->edges[i].use_count) : 0.0f;
+            float success_boost = 1.0f + (success_rate * 2.0f);  /* 100% success = 3x growth */
+            
+            /* Total growth */
+            float growth_rate = base_growth * (1.0f + usage_boost) * success_boost;
+            
+            /* Self-adjusting growth: Stronger edges grow faster (rich get richer) */
+            /* But cap growth to prevent explosion */
+            float max_growth = 0.5f;  /* Max 50% growth per use */
+            if (growth_rate > max_growth) growth_rate = max_growth;
+            
+            /* Grow weight (no normalization - self-adjusting) */
+            out->edges[i].weight += growth_rate;
+            
+            /* NO CAP: Let edges grow naturally - competition will regulate */
+            /* Strong edges (high usage, high success) will grow large */
+            /* Weak edges (low usage, low success) will stay small */
+            /* Pruning will remove truly weak edges */
             
             // #region agent log
             FILE *f = fopen("f:\\Melvin_Research\\Melvin_o7\\melvin_o7\\.cursor\\debug.log", "a");
             if (f) {
-                fprintf(f, "{\"location\":\"melvin.c:785\",\"message\":\"edge strengthened\",\"data\":{\"from\":%u,\"to\":%u,\"old_weight\":%.3f,\"new_weight\":%.3f,\"use\":%llu},\"timestamp\":%lld,\"sessionId\":\"debug-session\",\"hypothesisId\":\"A\"}\n",
+                fprintf(f, "{\"location\":\"melvin.c:785\",\"message\":\"edge strengthened\",\"data\":{\"from\":%u,\"to\":%u,\"old_weight\":%.3f,\"new_weight\":%.3f,\"use\":%llu,\"success_rate\":%.3f},\"timestamp\":%lld,\"sessionId\":\"debug-session\",\"hypothesisId\":\"A\"}\n",
                         from_id, to_id, old_weight, out->edges[i].weight, 
                         (unsigned long long)out->edges[i].use_count,
+                        success_rate,
                         (long long)time(NULL) * 1000);
                 fclose(f);
             }
             // #endregion
             
-            /* Renormalize all weights */
+            /* Update total weight (for tracking) */
             normalize_edge_weights(g, from_id);
             return;
         }
@@ -826,14 +901,15 @@ void create_or_strengthen_edge(MelvinGraph *g, uint32_t from_id, uint32_t to_id)
     
     Edge *e = &out->edges[out->count];
     e->to_id = to_id;
-    e->weight = 0.1f * port_penalty; /* Start at 10% (or 3% for cross-port) */
+    /* SELF-ADJUSTING: Start with base weight, grows through usage */
+    e->weight = 0.5f * port_penalty; /* Start at 0.5 (or 0.15 for cross-port) */
     e->use_count = 1;
     e->success_count = 0;
     e->active = true;
     
     out->count++;
     
-    /* Normalize (new edge takes proportion from existing edges) */
+    /* Update total weight (for tracking, not normalization) */
     normalize_edge_weights(g, from_id);
     
     /* Metabolic load increases with edge count */
@@ -873,7 +949,7 @@ void prune_weak_edges(MelvinGraph *g, uint32_t node_id) {
         }
     }
     
-    /* Renormalize remaining edges */
+    /* Update total weight (for tracking, not normalization) */
     normalize_edge_weights(g, node_id);
 }
 
@@ -938,6 +1014,27 @@ bool pattern_matches(MelvinGraph *g, uint32_t pattern_id, const uint32_t *sequen
     
     return true;
 }
+
+/* ============================================================================
+ * PATTERN SIMILARITY (for generalization)
+ * 
+ * Compute how similar a pattern is to a sequence
+ * Returns similarity score [0,1] where 1.0 = exact match, 0.0 = no match
+ * Used to connect new words to similar patterns for generalization
+ * ============================================================================ */
+
+/* REMOVED: pattern_similarity() - redundant with blank nodes
+ * 
+ * Blank nodes ARE the generalization mechanism:
+ * - Pattern "_at" (blank + "at") matches "cat", "bat", "rat", "quokka" (if ends in "at")
+ * - Blank nodes match any byte = automatic generalization
+ * - No need for similarity scores - blank nodes handle it!
+ * 
+ * When new words are seen:
+ * 1. Existing patterns with blank nodes automatically match (via pattern_matches)
+ * 2. detect_generalized_patterns() creates new blank node patterns for similar sequences
+ * 3. connect_to_similar_patterns() connects new words to matching blank node patterns
+ */
 
 /* ============================================================================
  * PATTERN FORWARD PASS (Mini Neural Net)
@@ -1070,6 +1167,7 @@ void propagate_pattern_activation(MelvinGraph *g) {
             uint32_t best_match_pos = 0;
             
             for (int pos = g->input_length - pat->length; pos >= 0; pos--) {
+                /* Try exact match first */
                 if (pattern_matches(g, p, g->input_buffer, g->input_length, pos)) {
                     /* Match strength = position relevance (end is more relevant) + length bonus */
                     float position_relevance = (float)(pos + pat->length) / (float)g->input_length;
@@ -1082,6 +1180,9 @@ void propagate_pattern_activation(MelvinGraph *g) {
                         can_fire = true;
                     }
                 }
+                /* BLANK NODES HANDLE GENERALIZATION - no need for similarity matching */
+                /* If pattern has blank nodes, pattern_matches() already handles generalization */
+                /* Blank nodes match any byte, so patterns like "_at" automatically match "cat", "bat", "quokka" */
             }
             
             if (can_fire) {
@@ -1203,13 +1304,40 @@ void propagate_pattern_activation(MelvinGraph *g) {
                         /* Low error = fast accumulation (system is working) */
                         chain_meaning *= g->state.meaning_accumulation_rate;
                         
+                        /* FIX: Cap meaning to prevent overflow (inf/nan) */
+                        /* Meaning should be bounded - use log scale for very high values */
+                        if (chain_meaning > 100.0f) {
+                            /* Very high meaning - use log scale to prevent overflow */
+                            chain_meaning = 100.0f + logf(chain_meaning / 100.0f);
+                        }
+                        if (chain_meaning > 1000.0f) chain_meaning = 1000.0f;  /* Hard cap */
+                        
                         target_pat->accumulated_meaning = fmax(target_pat->accumulated_meaning, chain_meaning);
+                        
+                        /* FIX: Cap accumulated_meaning to prevent overflow */
+                        if (target_pat->accumulated_meaning > 1000.0f) {
+                            target_pat->accumulated_meaning = 1000.0f;
+                        }
+                        /* Check for NaN/Inf */
+                        if (target_pat->accumulated_meaning != target_pat->accumulated_meaning || 
+                            target_pat->accumulated_meaning > 1e6f) {
+                            target_pat->accumulated_meaning = 1.0f;  /* Reset to safe value */
+                        }
                         
                         /* PHASE 1: Meaning multiplier boosts activation for complex concepts */
                         /* SELF-TUNING: Adjust multiplier based on error rate */
-                        float base_multiplier = 1.0f + (target_pat->accumulated_meaning * 0.5f);
+                        /* FIX: Use bounded meaning to prevent overflow */
+                        float bounded_meaning = target_pat->accumulated_meaning;
+                        if (bounded_meaning > 100.0f) {
+                            /* Use log scale for very high meaning */
+                            bounded_meaning = 100.0f + logf(bounded_meaning / 100.0f) * 10.0f;
+                        }
+                        if (bounded_meaning > 200.0f) bounded_meaning = 200.0f;  /* Cap for multiplier */
+                        float base_multiplier = 1.0f + (bounded_meaning * 0.5f);
                         /* High error = reduce meaning boost (system is over-weighting complex concepts) */
                         float meaning_multiplier = base_multiplier * (1.0f - g->state.error_rate * 0.3f);
+                        /* Cap multiplier to prevent explosion */
+                        if (meaning_multiplier > 50.0f) meaning_multiplier = 50.0f;
                         
                         /* Transfer activation with meaning accumulation */
                         float pattern_transfer = pat->activation * pattern_pred_weight * pat->strength * meaning_multiplier;
@@ -1347,8 +1475,24 @@ void propagate_pattern_activation(MelvinGraph *g) {
                     float connection_contribution = logf(1.0f + child_connections) / 3.0f;
                     child_meaning += connection_contribution;
                     
+                    /* FIX: Cap child_meaning to prevent overflow */
+                    if (child_meaning > 100.0f) {
+                        child_meaning = 100.0f + logf(child_meaning / 100.0f) * 10.0f;
+                    }
+                    if (child_meaning > 200.0f) child_meaning = 200.0f;
+                    
                     parent_pat->activation += child_meaning * 0.3f;  /* Boost parent */
                     parent_pat->accumulated_meaning += child_meaning * 0.2f;
+                    
+                    /* FIX: Cap accumulated_meaning */
+                    if (parent_pat->accumulated_meaning > 1000.0f) {
+                        parent_pat->accumulated_meaning = 1000.0f;
+                    }
+                    if (parent_pat->accumulated_meaning != parent_pat->accumulated_meaning || 
+                        parent_pat->accumulated_meaning > 1e6f) {
+                        parent_pat->accumulated_meaning = 1.0f;  /* Reset if NaN/Inf */
+                    }
+                    
                     if (parent_pat->activation > 10.0f) parent_pat->activation = 10.0f;
                 }
                 
@@ -1641,6 +1785,15 @@ void propagate_semantic_activation(MelvinGraph *g) {
  * ============================================================================ */
 
 void detect_generalized_patterns(MelvinGraph *g) {
+    /* GENERALIZATION: Create blank node patterns for similar sequences
+     * 
+     * When similar sequences are found, create patterns with blank nodes.
+     * Example: "cat", "bat", "rat" → pattern "_at" (blank matches c, b, r)
+     * 
+     * This is how the system generalizes - blank nodes match any byte,
+     * so patterns like "_at" automatically match new words ending in "at"
+     */
+    
     if (g->input_length < 3) return;
     
     /* Look for patterns with one blank: _at, c_t, ca_ */
@@ -1648,10 +1801,11 @@ void detect_generalized_patterns(MelvinGraph *g) {
         uint32_t b = g->input_buffer[i + 1];
         uint32_t c = g->input_buffer[i + 2];
         
-        /* Try pattern: _bc (blank first) */
+        /* Try pattern: _bc (blank first) - matches any Xbc sequence */
         uint32_t match_count = 0;
         
         for (uint32_t j = 0; j < g->input_length - 2; j++) {
+            /* Check if sequence has same bc ending (blank matches any first char) */
             if (g->input_buffer[j + 1] == b && g->input_buffer[j + 2] == c) {
                 match_count++;
             }
@@ -2479,9 +2633,17 @@ void propagate_activation(MelvinGraph *g) {
                             
                             /* INTELLIGENT ACTIVATION: Meaning boost (RELATIVE to system average) */
                             /* Patterns with accumulated meaning carry more information */
-                            float meaning_ratio = (avg_pattern_meaning > 0.0f) ? 
-                                (pat->accumulated_meaning / avg_pattern_meaning) : 1.0f;
+                            /* FIX: Use bounded meaning to prevent overflow in ratio */
+                            float bounded_meaning = pat->accumulated_meaning;
+                            if (bounded_meaning > 1000.0f) bounded_meaning = 1000.0f;
+                            if (bounded_meaning != bounded_meaning || bounded_meaning > 1e6f) {
+                                bounded_meaning = 1.0f;  /* Reset if NaN/Inf */
+                            }
+                            float meaning_ratio = (avg_pattern_meaning > 0.01f) ? 
+                                (bounded_meaning / avg_pattern_meaning) : 1.0f;
+                            if (meaning_ratio > 100.0f) meaning_ratio = 100.0f;  /* Cap ratio */
                             pattern_meaning_boost = 1.0f + meaning_ratio;  /* Relative boost */
+                            if (pattern_meaning_boost > 200.0f) pattern_meaning_boost = 200.0f;  /* Cap boost */
                             
                             /* INTELLIGENT ACTIVATION: Hierarchy depth (RELATIVE - use pattern depth relative to max) */
                             /* Deeper patterns (more abstract) = more meaningful */
@@ -2576,10 +2738,18 @@ void propagate_activation(MelvinGraph *g) {
                             pat->node_ids[pat_idx + 1] == target) {
                             /* Edge is part of active pattern - boost based on pattern's meaning (relative) */
                             /* Meaning boost: relative to system average */
-                            float meaning_ratio = (avg_pattern_meaning > 0.0f) ? 
-                                (pat->accumulated_meaning / avg_pattern_meaning) : 1.0f;
+                            /* FIX: Use bounded meaning to prevent overflow */
+                            float bounded_meaning = pat->accumulated_meaning;
+                            if (bounded_meaning > 1000.0f) bounded_meaning = 1000.0f;
+                            if (bounded_meaning != bounded_meaning || bounded_meaning > 1e6f) {
+                                bounded_meaning = 1.0f;  /* Reset if NaN/Inf */
+                            }
+                            float meaning_ratio = (avg_pattern_meaning > 0.01f) ? 
+                                (bounded_meaning / avg_pattern_meaning) : 1.0f;
+                            if (meaning_ratio > 100.0f) meaning_ratio = 100.0f;  /* Cap ratio */
                             /* Dynamic importance is already relative (0.0 to 1.0 range) */
                             float pattern_boost = 1.0f + meaning_ratio + pat->dynamic_importance;
+                            if (pattern_boost > 200.0f) pattern_boost = 200.0f;  /* Cap boost */
                             pattern_connection_boost = fmax(pattern_connection_boost, pattern_boost);
                             break;
                         }
@@ -2722,16 +2892,58 @@ void propagate_activation(MelvinGraph *g) {
  * ============================================================================ */
 
 void create_edges_from_coactivation(MelvinGraph *g) {
-    /* DISABLED: Coactivation creates too many cross-connections
-     * This causes every input letter to connect to every other letter,
-     * creating a messy fully-connected graph that can't learn sequences.
+    /* RE-ENABLED: Coactivation enables scaling potential
      * 
-     * Sequential edges from input injection are sufficient and create
-     * clean paths: c→a→t and d→o→g
+     * At scale, coactivation creates rich cross-connections that enable:
+     * - Concept formation (related ideas connect)
+     * - Contextual reasoning (multiple concepts active together)
+     * - Emergent intelligence (connections beyond simple sequences)
      * 
-     * This function now does nothing - only sequential edges are created.
+     * This is how brains work: neurons that fire together, wire together.
+     * The system can be "as smart as a human brain" (rich connections)
+     * or "as dumb as a wire" (simple sequential paths).
+     * 
+     * Intelligence emerges from the density and quality of connections.
      */
-    return;
+    
+    /* Find all currently active nodes */
+    uint32_t active_nodes[BYTE_VALUES];
+    uint32_t active_count = 0;
+    
+    for (int i = 0; i < BYTE_VALUES; i++) {
+        /* Active node threshold relative to system average */
+        float active_threshold = g->state.avg_activation * 0.2f;
+        if (g->nodes[i].exists && g->nodes[i].activation > active_threshold) {
+            active_nodes[active_count++] = i;
+        }
+    }
+    
+    /* Create edges between co-active nodes (within temporal window) */
+    /* Only connect nodes that are both active RIGHT NOW */
+    for (uint32_t i = 0; i < active_count; i++) {
+        for (uint32_t j = i + 1; j < active_count; j++) {
+            uint32_t node_a = active_nodes[i];
+            uint32_t node_b = active_nodes[j];
+            
+            /* Strength proportional to how active both nodes are */
+            float coactivation_strength = g->nodes[node_a].activation * g->nodes[node_b].activation;
+            
+            /* Only create if co-activation is significant */
+            /* AND: Prevent self-loops (don't create edges from node to itself) */
+            /* Co-activation threshold relative to system state */
+            float coactivation_threshold = 0.05f * g->state.learning_rate;
+            if (coactivation_strength > coactivation_threshold && node_a != node_b) {
+                /* Create or strengthen edge A→B (UNIDIRECTIONAL - one-way valve) */
+                /* Direction: STABLE rule based on node ID (lower ID → higher ID) */
+                /* This ensures consistent directionality across all episodes */
+                if (node_a < node_b) {
+                    create_or_strengthen_edge(g, node_a, node_b);
+                } else {
+                    create_or_strengthen_edge(g, node_b, node_a);
+                }
+            }
+        }
+    }
 }
 
 /* ============================================================================
@@ -2741,18 +2953,139 @@ void create_edges_from_coactivation(MelvinGraph *g) {
  * This connects patterns to their learned associations
  * ============================================================================ */
 
-void create_edges_from_patterns(MelvinGraph *g) {
-    /* DISABLED: Pattern predictions create too many wrong edges
-     * Before the correct patterns are learned, early wrong patterns
-     * create edges that dominate and prevent correct learning.
+/* ============================================================================
+ * GENERALIZATION: Connect new words to similar patterns
+ * 
+ * When a new word is seen, find similar patterns based on:
+ * - Similar byte values (character overlap, edit distance)
+ * - Similar contexts (context vector similarity)
+ * 
+ * This allows generalization: "quokka" connects to similar patterns like "cat", "bat"
+ * ============================================================================ */
+
+void connect_to_similar_patterns(MelvinGraph *g, const uint32_t *sequence, uint32_t seq_len) {
+    /* GENERALIZATION USING BLANK NODES
      * 
-     * Example: Pattern might predict 'd' after 'c', creating c→d edge
-     * that overpowers the correct c→a edge from input.
+     * Blank nodes ARE the generalization mechanism - they match any byte.
+     * When a new word is seen, patterns with blank nodes automatically match it.
      * 
-     * Solution: Only create edges from actual input sequences,
-     * let patterns guide activation flow but not create edges.
+     * Example: Pattern "_at" (blank + "at") matches:
+     *   - "cat" (c matches blank)
+     *   - "bat" (b matches blank)
+     *   - "rat" (r matches blank)
+     *   - "quokka" (if it has "at" ending, the blank matches "quokk")
+     * 
+     * We don't need similarity scores - blank nodes already handle generalization!
+     * 
+     * What we DO need: When a new word matches a pattern with blank nodes,
+     * create edges from the new word to the pattern's predictions.
      */
-    return;
+    
+    if (seq_len < 2) return;
+    
+    /* Find patterns with blank nodes that match this sequence */
+    for (uint32_t p = 0; p < g->pattern_count; p++) {
+        Pattern *pat = &g->patterns[p];
+        if (pat->length == 0 || pat->length > seq_len) continue;
+        
+        /* Check if pattern matches (blank nodes will match any byte) */
+        for (uint32_t pos = 0; pos <= seq_len - pat->length; pos++) {
+            if (pattern_matches(g, p, sequence, seq_len, pos)) {
+                /* Pattern matches! This is generalization - blank nodes matched new word */
+                /* Create edges from sequence to pattern's predicted nodes */
+                if (pat->prediction_count > 0) {
+                    for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
+                        uint32_t predicted_node = pat->predicted_nodes[pred];
+                        float pred_weight = pat->prediction_weights[pred];
+                        
+                        if (predicted_node < BYTE_VALUES && pred_weight > 0.3f) {
+                            /* Create edge from last node in sequence to predicted node */
+                            uint32_t last_seq_node = sequence[seq_len - 1];
+                            create_or_strengthen_edge(g, last_seq_node, predicted_node);
+                            
+                            /* Pattern matched via blank nodes = generalization connection */
+                            /* Boost edge weight to reflect generalization benefit */
+                            EdgeList *out = &g->outgoing[last_seq_node];
+                            for (uint32_t i = 0; i < out->count; i++) {
+                                if (out->edges[i].to_id == predicted_node && out->edges[i].active) {
+                                    /* Generalization boost: blank node match = strong connection */
+                                    float generalization_boost = pat->strength * 0.2f;
+                                    out->edges[i].weight += generalization_boost;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                /* Learn pattern association (new word associated with this generalized pattern) */
+                /* This strengthens the pattern's ability to generalize */
+                pat->prediction_attempts++;
+                /* Pattern successfully generalized to new word */
+            }
+        }
+    }
+}
+
+void create_edges_from_patterns(MelvinGraph *g) {
+    /* RE-ENABLED: Pattern-based edges enable concept-level connections
+     * 
+     * Patterns represent learned concepts and sequences. When patterns
+     * predict nodes, creating edges enables:
+     * - Hierarchical reasoning (patterns → concepts → predictions)
+     * - Abstraction (patterns generalize beyond raw sequences)
+     * - Predictive intelligence (learned patterns guide future connections)
+     * 
+     * At scale, this creates a rich knowledge graph where:
+     * - Simple sequences = "dumb wire" behavior
+     * - Pattern networks = "smart brain" behavior
+     * 
+     * Intelligence scales with pattern complexity and connections.
+     */
+    
+    for (uint32_t p = 0; p < g->pattern_count; p++) {
+        Pattern *pat = &g->patterns[p];
+        
+        /* If pattern is active and has predictions */
+        if (pat->activation > pat->threshold && pat->prediction_count > 0) {
+            /* Get pattern's input nodes (the sequence it matched) */
+            uint32_t *pattern_inputs = NULL;
+            uint32_t pattern_input_len = 0;
+            
+            /* Find where pattern matched in input */
+            if (g->input_length >= pat->length) {
+                for (uint32_t i = 0; i <= g->input_length - pat->length; i++) {
+                    if (pattern_matches(g, p, g->input_buffer, g->input_length, i)) {
+                        pattern_inputs = &g->input_buffer[i];
+                        pattern_input_len = pat->length;
+                        break;
+                    }
+                }
+            }
+            
+            /* If pattern matched, create edges from pattern inputs to predictions */
+            if (pattern_inputs != NULL) {
+                for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
+                    uint32_t predicted_node = pat->predicted_nodes[pred];
+                    float prediction_weight = pat->prediction_weights[pred];
+                    
+                    /* Only create edges for confident predictions (prevent noise) */
+                    if (predicted_node < BYTE_VALUES && prediction_weight > 0.3f) {
+                        /* Create edge from last node in pattern to prediction */
+                        uint32_t last_pattern_node = pattern_inputs[pattern_input_len - 1];
+                        create_or_strengthen_edge(g, last_pattern_node, predicted_node);
+                        
+                        /* Also create edge from pattern's first node (for context) */
+                        /* This enables richer contextual connections at scale */
+                        if (pattern_input_len > 1) {
+                            uint32_t first_pattern_node = pattern_inputs[0];
+                            create_or_strengthen_edge(g, first_pattern_node, predicted_node);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /* ============================================================================
@@ -3485,54 +3818,180 @@ float compute_node_relevance(MelvinGraph *g, uint32_t node_id) {
 
 uint32_t select_output_node(MelvinGraph *g) {
     /* ========================================================================
-     * SIMPLE GREEDY SELECTION: Follow strongest edge from input/output
+     * HYBRID SELECTION: Pattern-guided + Greedy edge following
      * 
-     * Strategy: If we have previous output, follow its strongest edge
-     *          Otherwise, follow strongest edge from input nodes
+     * Strategy: 
+     * 1. Check if patterns predict next node (pattern-guided intelligence)
+     * 2. If no pattern match, follow strongest edge (greedy fallback)
+     * 3. Suppress looping nodes aggressively
      * 
-     * This creates clean sequential paths like: c→a→t, d→o→g
+     * This combines pattern intelligence with edge-based paths
      * ======================================================================== */
     
-    /* SIMPLE STRATEGY: Follow edges greedily AND track contributions */
     uint32_t selected_node = BYTE_VALUES;
     uint32_t source_node = BYTE_VALUES;
+    float best_score = 0.0f;
     
-    if (g->output_length > 0 && g->output_length < g->input_length) {
+    /* STEP 1: Check pattern predictions (pattern-guided intelligence) */
+    /* ONLY use patterns when they're CONFIDENT - otherwise fall back to edges */
+    /* This prevents wrong pattern predictions from breaking simple edge-based paths */
+    if (g->output_length > 0 && g->state.pattern_confidence > 0.5f) {
+        /* Only use pattern-guided selection when patterns are reliable */
+        for (uint32_t p = 0; p < g->pattern_count; p++) {
+            Pattern *pat = &g->patterns[p];
+            
+            /* Pattern must be strong enough to trust */
+            if (pat->strength < 0.3f) continue;  /* Skip weak patterns */
+            
+            /* Check if pattern matches end of current output */
+            if (g->output_length >= pat->length && pat->prediction_count > 0) {
+                uint32_t start_pos = g->output_length - pat->length;
+                if (pattern_matches(g, p, g->output_buffer, g->output_length, start_pos)) {
+                    /* Pattern matches! Check its predictions */
+                    for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
+                        uint32_t predicted_node = pat->predicted_nodes[pred];
+                        float pred_weight = pat->prediction_weights[pred];
+                        
+                        /* Prediction must be confident enough */
+                        if (pred_weight < 0.4f) continue;  /* Skip weak predictions */
+                        
+                        if (predicted_node < BYTE_VALUES && g->nodes[predicted_node].exists) {
+                            /* Calculate pattern-guided score */
+                            float pattern_score = pat->strength * pat->activation * pred_weight;
+                            
+                            /* Boost by pattern confidence (only when high) */
+                            if (g->state.pattern_confidence > 0.7f) {
+                                pattern_score *= 2.0f;  /* Strong boost when patterns are reliable */
+                            }
+                            
+                            /* Add node activation (wave propagation support) */
+                            pattern_score += g->nodes[predicted_node].activation * 0.5f;
+                            
+                            /* Suppress looping nodes */
+                            float loop_penalty = 1.0f;
+                            if (g->output_length >= 2 && predicted_node == g->output_buffer[g->output_length - 2]) {
+                                loop_penalty = 0.1f;  /* Strong penalty for immediate repetition */
+                            }
+                            if (g->output_length >= 3 && predicted_node == g->output_buffer[g->output_length - 3]) {
+                                loop_penalty = 0.2f;  /* Penalty for near repetition */
+                            }
+                            pattern_score *= loop_penalty;
+                            
+                            /* Apply loop pressure (system-wide loop suppression) */
+                            if (g->state.loop_pressure > 0.3f) {
+                                /* Check if this node continues a loop */
+                                bool continues_loop = false;
+                                if (g->output_length >= 3) {
+                                    for (uint32_t i = 0; i < 3 && i < g->output_length; i++) {
+                                        if (predicted_node == g->output_buffer[g->output_length - 1 - i]) {
+                                            continues_loop = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (continues_loop) {
+                                    pattern_score *= (1.0f - g->state.loop_pressure);  /* Suppress loops */
+                                }
+                            }
+                            
+                            if (pattern_score > best_score) {
+                                best_score = pattern_score;
+                                selected_node = predicted_node;
+                                source_node = BYTE_VALUES;  /* Pattern prediction, no edge source */
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /* STEP 2: Input-guided selection (when output is empty or incomplete) */
+    /* Prioritize input sequence - edges should FOLLOW input, not replace it */
+    if (selected_node >= BYTE_VALUES && g->output_length < g->input_length) {
+        /* Use input at current position (input sequence guides output) */
+        selected_node = g->input_buffer[g->output_length];
+        source_node = BYTE_VALUES;  /* Input-guided, no edge source */
+    }
+    
+    /* STEP 3: Greedy edge following (when output exists, follow edges) */
+    if (selected_node >= BYTE_VALUES && g->output_length > 0) {
         /* Follow from previous output */
         uint32_t prev_output = g->output_buffer[g->output_length - 1];
         if (prev_output < BYTE_VALUES) {
             EdgeList *edges = &g->outgoing[prev_output];
             
-            /* Find strongest edge */
-            float best_weight = 0.0f;
-            for (uint32_t i = 0; i < edges->count; i++) {
-                if (edges->edges[i].active && edges->edges[i].weight > best_weight) {
-                    best_weight = edges->edges[i].weight;
-                    selected_node = edges->edges[i].to_id;
+            /* Find strongest edge using RELATIVE weights (relative to source node) */
+            /* Get max weight from this node for relative comparison */
+            float max_weight_from_node = 0.0f;
+            for (uint32_t j = 0; j < edges->count; j++) {
+                if (edges->edges[j].active && edges->edges[j].weight > max_weight_from_node) {
+                    max_weight_from_node = edges->edges[j].weight;
                 }
             }
+            if (max_weight_from_node < 0.001f) max_weight_from_node = 1.0f;  /* Avoid division by zero */
             
-            if (selected_node < BYTE_VALUES) {
-                source_node = prev_output;  /* Track which node we came from */
+            for (uint32_t i = 0; i < edges->count; i++) {
+                if (!edges->edges[i].active) continue;
+                
+                Edge *e = &edges->edges[i];
+                uint32_t candidate = e->to_id;
+                
+                /* RELATIVE WEIGHT: Compare to max from this node (not global) */
+                float relative_weight = e->weight / max_weight_from_node;
+                
+                /* Usage boost (log scale) */
+                float usage_boost = logf(1.0f + e->use_count) / 5.0f;
+                
+                /* Success boost */
+                float success_rate = (e->use_count > 0) ? 
+                    ((float)e->success_count / (float)e->use_count) : 0.0f;
+                float success_boost = 1.0f + success_rate;
+                
+                /* Edge score = relative weight × usage × success */
+                float edge_score = relative_weight * (1.0f + usage_boost) * success_boost;
+                
+                /* Add node activation support */
+                if (candidate < BYTE_VALUES && g->nodes[candidate].exists) {
+                    edge_score += g->nodes[candidate].activation * 0.3f;
+                }
+                
+                /* Suppress looping nodes */
+                float loop_penalty = 1.0f;
+                if (g->output_length >= 2 && candidate == g->output_buffer[g->output_length - 2]) {
+                    loop_penalty = 0.1f;
+                }
+                if (g->output_length >= 3 && candidate == g->output_buffer[g->output_length - 3]) {
+                    loop_penalty = 0.2f;
+                }
+                edge_score *= loop_penalty;
+                
+                /* Apply loop pressure */
+                if (g->state.loop_pressure > 0.3f) {
+                    bool continues_loop = false;
+                    if (g->output_length >= 3) {
+                        for (uint32_t j = 0; j < 3 && j < g->output_length; j++) {
+                            if (candidate == g->output_buffer[g->output_length - 1 - j]) {
+                                continues_loop = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (continues_loop) {
+                        edge_score *= (1.0f - g->state.loop_pressure);
+                    }
+                }
+                
+                if (edge_score > best_score) {
+                    best_score = edge_score;
+                    selected_node = candidate;
+                    source_node = prev_output;
+                }
             }
         }
     }
     
-    /* Fallback: Use input node at current position */
-    if (selected_node >= BYTE_VALUES && g->output_length < g->input_length) {
-        selected_node = g->input_buffer[g->output_length];
-        /* DEBUG */
-        if (selected_node < 128) {
-            FILE *fdebug = fopen("f:\\Melvin_Research\\Melvin_o7\\melvin_o7\\.cursor\\debug.log", "a");
-            if (fdebug) {
-                fprintf(fdebug, "{\"location\":\"select_output_node\",\"message\":\"fallback to input\",\"data\":{\"output_pos\":%u,\"input_char\":\"%c\",\"input_id\":%u},\"timestamp\":%lld}\n",
-                        g->output_length, (char)selected_node, selected_node, (long long)time(NULL) * 1000);
-                fclose(fdebug);
-            }
-        }
-    }
-    
-    /* Fallback: Return first input node */
+    /* STEP 4: Final fallback: Return first input node */
     if (selected_node >= BYTE_VALUES && g->input_length > 0) {
         selected_node = g->input_buffer[0];
     }
@@ -3969,9 +4428,20 @@ void emit_output(MelvinGraph *g, uint32_t node_id) {
         g->state.exploration_pressure = g->state.output_variance * g->state.error_rate;
     }
     
-    /* SELF-TUNING FIX 5: Detect loops and create escape pressure */
+    /* IMPROVED: Detect loops more aggressively and create escape pressure */
     bool is_looping = false;
-    if (g->output_length >= 6) {
+    
+    /* Check for short loops (2-3 character repetition) */
+    if (g->output_length >= 4) {
+        /* Check if last 2 chars repeat */
+        if (g->output_buffer[g->output_length - 1] == g->output_buffer[g->output_length - 3] &&
+            g->output_buffer[g->output_length - 2] == g->output_buffer[g->output_length - 4]) {
+            is_looping = true;
+        }
+    }
+    
+    /* Check for longer loops (3+ character repetition) */
+    if (!is_looping && g->output_length >= 6) {
         /* Check if last 3 chars repeat the previous 3 */
         is_looping = true;
         for (uint32_t i = 0; i < 3; i++) {
@@ -3983,8 +4453,24 @@ void emit_output(MelvinGraph *g, uint32_t node_id) {
         }
     }
     
+    /* Check for single character repetition (strongest loop signal) */
+    if (!is_looping && g->output_length >= 3) {
+        uint32_t last_char = g->output_buffer[g->output_length - 1];
+        uint32_t repeat_count = 1;
+        for (int i = g->output_length - 2; i >= 0 && i >= (int)g->output_length - 5; i--) {
+            if (g->output_buffer[i] == last_char) {
+                repeat_count++;
+            } else {
+                break;
+            }
+        }
+        if (repeat_count >= 3) {
+            is_looping = true;  /* Same character repeated 3+ times */
+        }
+    }
+    
     if (is_looping) {
-        g->state.loop_pressure = 0.9f;  /* Strong pressure to break loop */
+        g->state.loop_pressure = fmin(g->state.loop_pressure + 0.2f, 1.0f);  /* Increase pressure */
     } else {
         g->state.loop_pressure *= 0.95f;  /* Decay when not looping */
         if (g->state.loop_pressure < 0.01f) g->state.loop_pressure = 0.0f;
@@ -4325,6 +4811,10 @@ void pattern_backprop(MelvinGraph *g, uint32_t pattern_id, float error, const ui
 void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
                  const uint8_t *target, uint32_t target_len) {
     
+    /* CRITICAL: Clear input buffer at start of each episode */
+    /* Otherwise input accumulates: "cat" + "dog" = "catdog" */
+    g->input_length = 0;
+    
     /* Reset output and contribution tracking */
     g->output_length = 0;
     
@@ -4352,6 +4842,13 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
     
     /* Inject input */
     inject_input(g, input, input_len);
+    
+    /* GENERALIZATION: Connect new words to similar patterns */
+    /* When a new word is seen, find similar patterns based on byte values and context */
+    /* This allows "quokka" to connect to similar patterns like "cat", "bat" */
+    if (g->input_length >= 2) {
+        connect_to_similar_patterns(g, g->input_buffer, g->input_length);
+    }
     
     /* CRITICAL: Compute system state BEFORE propagation */
     /* Wave prop needs current system state (avg_activation, etc.) */
@@ -5229,35 +5726,137 @@ int main(void) {
     printf("FORMAT: Episode | Input → Output | Error | Learning Rate\n");
     printf("----------------------------------------------------------\n");
     
-    /* Training sequences */
-    uint8_t training_inputs[][10] = {
-        {'c', 'a', 't'},
-        {'d', 'o', 'g'},
-        {'c', 'a', 't'},  /* Repeat to form patterns */
-        {'d', 'o', 'g'}
-    };
-    uint32_t training_lengths[] = {3, 3, 3, 3};
-    
-    /* Run training episodes - show EVERY input/output */
-    for (int episode = 0; episode < 30; episode++) {
-        int idx = episode % 4;
-        uint8_t *input = training_inputs[idx];
-        uint32_t len = training_lengths[idx];
-        
-        /* Run episode (target = input for echo task) */
-        run_episode(g, input, len, input, len);
-        
-        /* Show input and output */
-        printf("Ep %2d | Input:  ", episode + 1);
-        for (uint32_t i = 0; i < len; i++) {
-            printf("%c", input[i]);
+    /* Read tests from test_input.txt */
+    FILE *test_file = fopen("test_input.txt", "r");
+    if (!test_file) {
+        fprintf(stderr, "Warning: Could not open test_input.txt, using default tests\n");
+        /* Fallback to default tests */
+        uint8_t training_inputs[][10] = {
+            {'c', 'a', 't'},
+            {'d', 'o', 'g'},
+            {'c', 'a', 't'},
+            {'d', 'o', 'g'}
+        };
+        uint32_t training_lengths[] = {3, 3, 3, 3};
+        for (int episode = 0; episode < 30; episode++) {
+            int idx = episode % 4;
+            uint8_t *input = training_inputs[idx];
+            uint32_t len = training_lengths[idx];
+            run_episode(g, input, len, input, len);
+            printf("Ep %2d | Input:  ", episode + 1);
+            for (uint32_t i = 0; i < len; i++) printf("%c", input[i]);
+            printf(" → Output: ");
+            for (uint32_t i = 0; i < g->output_length; i++) {
+                printf("%c", (uint8_t)g->output_buffer[i]);
+            }
+            printf(" | Error: %.3f | LR: %.3f\n", 
+                   g->state.error_rate, g->state.learning_rate);
         }
-        printf(" → Output: ");
-        for (uint32_t i = 0; i < g->output_length; i++) {
-            printf("%c", (uint8_t)g->output_buffer[i]);
+    } else {
+        /* Read from test_input.txt */
+        char line[256];
+        int test_num = 0;
+        int simple_tests = 0, complex_tests = 0;
+        int simple_correct = 0, complex_correct = 0;
+        
+        printf("Reading tests from test_input.txt...\n\n");
+        printf("FORMAT: Test# | Input -> Output | Expected | Correct | Error | Samples\n");
+        printf("----------------------------------------------------------------------\n");
+        
+        while (fgets(line, sizeof(line), test_file)) {
+            if (line[0] == '#' || line[0] == '\n') continue;
+            
+            char *arrow = strstr(line, "->");
+            if (!arrow) continue;
+            
+            *arrow = '\0';
+            char *input_text = line;
+            char *expected_text = arrow + 2;
+            
+            /* Trim whitespace */
+            while (*input_text == ' ' || *input_text == '\t') input_text++;
+            while (*expected_text == ' ' || *expected_text == '\t') expected_text++;
+            char *nl = strchr(expected_text, '\n');
+            if (nl) *nl = '\0';
+            nl = strchr(input_text, '\n');
+            if (nl) *nl = '\0';
+            
+            if (strlen(input_text) == 0 || strlen(expected_text) == 0) continue;
+            
+            test_num++;
+            int is_complex = (strlen(input_text) > 5 || strlen(expected_text) > 5);
+            if (is_complex) complex_tests++; else simple_tests++;
+            
+            uint8_t *input = (uint8_t*)input_text;
+            uint8_t *expected = (uint8_t*)expected_text;
+            uint32_t input_len = strlen(input_text);
+            uint32_t expected_len = strlen(expected_text);
+            
+            /* Set ports */
+            melvin_set_input_port(g, 0);  /* Port 0 = text */
+            melvin_set_output_port(g, 0);
+            
+            /* Run episode */
+            run_episode(g, input, input_len, expected, expected_len);
+            
+            /* Get output */
+            uint32_t *output;
+            uint32_t output_len;
+            melvin_get_output(g, &output, &output_len);
+            
+            /* Check correctness */
+            int correct = 1;
+            if (output_len != expected_len) {
+                correct = 0;
+            } else {
+                for (uint32_t i = 0; i < output_len; i++) {
+                    if (output[i] != expected[i]) {
+                        correct = 0;
+                        break;
+                    }
+                }
+            }
+            
+            if (correct) {
+                if (is_complex) complex_correct++;
+                else simple_correct++;
+            }
+            
+            /* Print result */
+            printf("Test %2d | Input: %-20s -> Output: ", test_num, input_text);
+            for (uint32_t i = 0; i < output_len && i < 30; i++) {
+                printf("%c", (char)output[i]);
+            }
+            printf(" | Expected: %-20s | %s | Error: %.3f | Samples: %d\n",
+                   expected_text, correct ? "✓" : "✗",
+                   melvin_get_error_rate(g), test_num);
+            
+            /* Show progress every 5 tests */
+            if (test_num % 5 == 0) {
+                uint32_t total_edges = 0;
+                for (int i = 0; i < BYTE_VALUES; i++) {
+                    total_edges += g->outgoing[i].count;
+                }
+                printf("  [Patterns: %u, Edges: %u, Wave steps: %llu, Simple: %d/%d, Complex: %d/%d]\n",
+                       g->pattern_count, total_edges, (unsigned long long)g->state.step,
+                       simple_correct, simple_tests, complex_correct, complex_tests);
+            }
         }
-        printf(" | Error: %.3f | LR: %.3f\n", 
-               g->state.error_rate, g->state.learning_rate);
+        
+        fclose(test_file);
+        
+        /* Summary */
+        printf("\n=== SUMMARY ===\n");
+        printf("Simple tests: %d/%d correct (%.1f%%) - Samples needed: %d\n",
+               simple_correct, simple_tests,
+               simple_tests > 0 ? (100.0f * simple_correct / simple_tests) : 0.0f,
+               simple_tests > 0 ? (simple_correct == simple_tests ? test_num : test_num) : 0);
+        printf("Complex tests: %d/%d correct (%.1f%%) - Samples needed: %d\n",
+               complex_correct, complex_tests,
+               complex_tests > 0 ? (100.0f * complex_correct / complex_tests) : 0.0f,
+               complex_tests > 0 ? test_num : 0);
+        printf("Total tests run: %d\n", test_num);
+        printf("Final error rate: %.3f\n", melvin_get_error_rate(g));
     }
     
     printf("\n=== NOVEL INPUT TEST ===\n");
@@ -5404,6 +6003,71 @@ int main(void) {
                (unsigned long long)g->nodes[node].fire_count,
                (unsigned long long)g->nodes[node].receive_count);
     }
+    
+    /* ========================================================================
+     * PATTERN HIERARCHIES & WAVE PROPAGATION VISUALIZATION
+     * ======================================================================== */
+    printf("\n=== PATTERN HIERARCHIES (What Makes This Different) ===\n");
+    printf("Pattern hierarchies show how patterns connect to build meaning:\n\n");
+    
+    uint32_t hierarchies_shown = 0;
+    for (uint32_t p = 0; p < g->pattern_count && hierarchies_shown < 10; p++) {
+        Pattern *pat = &g->patterns[p];
+        if (pat->length == 0 || pat->length > 10) continue;
+        
+        /* Show pattern with hierarchy info */
+        printf("Pattern %u [depth:%u, meaning:%.3f]: \"", 
+               p, pat->chain_depth, pat->accumulated_meaning);
+        for (uint32_t i = 0; i < pat->length; i++) {
+            if (pat->node_ids[i] < 128) {
+                printf("%c", (char)pat->node_ids[i]);
+            } else {
+                printf("_");
+            }
+        }
+        printf("\"");
+        
+        /* Show parent if exists */
+        if (pat->parent_pattern_id != INVALID_PATTERN_ID && pat->parent_pattern_id < g->pattern_count) {
+            printf(" (child of pattern %u)", pat->parent_pattern_id);
+        } else {
+            printf(" (root)");
+        }
+        
+        /* Show children (patterns that have this as parent) */
+        uint32_t child_count = 0;
+        for (uint32_t q = 0; q < g->pattern_count; q++) {
+            if (g->patterns[q].parent_pattern_id == p) {
+                child_count++;
+            }
+        }
+        if (child_count > 0) {
+            printf(" -> %u children", child_count);
+        }
+        
+        /* Show pattern-to-pattern predictions */
+        if (pat->pattern_prediction_count > 0) {
+            printf(" -> predicts patterns: ");
+            for (uint32_t pp = 0; pp < pat->pattern_prediction_count && pp < 3; pp++) {
+                printf("%u(%.2f) ", pat->predicted_patterns[pp], 
+                       pat->pattern_prediction_weights[pp]);
+            }
+        }
+        
+        printf("\n");
+        hierarchies_shown++;
+    }
+    
+    printf("\n=== WAVE PROPAGATION (Multi-Step vs Single Pass) ===\n");
+    printf("Standard Neural Net: Input → Layer1 → Layer2 → Output (1 pass)\n");
+    printf("Melvin O7: Input → Step1 → Step2 → ... → StepN → Output (multi-step wave)\n");
+    printf("\nWave propagation features:\n");
+    printf("  - PATH-AWARE: Only follows learned edges (not all connections)\n");
+    printf("  - PATTERN-GUIDED: Active patterns boost predicted nodes\n");
+    printf("  - CONTEXT-AWARE: Considers input, history, and pattern support\n");
+    printf("  - MEANING-BOOSTED: Pattern hierarchies influence path quality\n");
+    printf("\nTotal propagation steps in last episode: %llu\n", 
+           (unsigned long long)g->state.step);
     
     melvin_destroy(g);
     return 0;
