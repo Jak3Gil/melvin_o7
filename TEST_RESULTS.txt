@@ -1,0 +1,56 @@
+MELVIN O7: Pattern Hierarchies & Wave Propagation Test Results
+================================================================
+
+SIMPLE TESTS (Wire-like behavior):
+----------------------------------
+✓ cat -> cat (Sample 1)
+✓ dog -> dog (Sample 2)  
+✓ bat -> bat (Sample 3)
+✓ rat -> rat (Sample 4)
+✓ hat -> hat (Sample 5)
+
+Result: 5/5 correct (100%) - Works immediately, 1-5 samples needed
+
+COMPLEX TESTS (Brain-like behavior):
+------------------------------------
+✗ hello -> hat a (Sample 6)
+✗ world -> wog a (Sample 7)
+✗ hello -> hat a (Sample 8)
+✗ world -> wogt (Sample 9)
+✗ what is -> wogt ht (Sample 10)
+✗ what is the -> wot rwot rw (Sample 11)
+✗ what is the capital -> wot wotwotwotwotwot (Sample 12)
+✗ what is the capital of -> wotwotwotwotwotwotwotw (Sample 13)
+✗ what is the capital of france -> wotwotwotwotwotwotwotwotwotwo (Sample 14)
+✗ the quick brown fox -> twotwotwotwotwotwot (Sample 18)
+✗ jumps over the lazy dog -> juwotwotwotwotwotwotwot (Sample 19)
+
+Result: 0/13 correct (0%) - Attempts but fails, 26+ samples and still failing
+
+TRAINING SAMPLES NEEDED:
+------------------------
+Simple tasks: 1-5 samples (immediate success)
+Complex tasks: 26+ samples (still failing)
+
+PATTERN HIERARCHIES:
+--------------------
+✓ Forming hierarchies (depth 1, depth 2)
+✓ Meaning accumulation happening
+⚠ Some patterns show "inf" meaning (overflow issue)
+✓ Pattern-to-pattern predictions working
+
+WAVE PROPAGATION:
+-----------------
+✓ Multi-step working (518 steps vs 1 pass in standard NN)
+✓ Path-aware propagation
+✓ Pattern-guided flow
+⚠ Error rate increases with complexity (0.450 → 0.732)
+
+CONCLUSION:
+-----------
+- System works perfectly for simple tasks (wire-like)
+- System attempts complex tasks but fails (needs improvement)
+- Pattern hierarchies and wave propagation are active
+- Complex sequences get stuck in loops ("wotwotwot...")
+- More training or architectural improvements needed for complex tasks
+

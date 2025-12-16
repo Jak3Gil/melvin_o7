@@ -1,0 +1,77 @@
+SELF-ADJUSTING FIXES (No Normalization, Usage-Based Learning)
+==============================================================
+
+PROBLEM IDENTIFIED:
+-------------------
+1. Edge normalization was reducing weights too much
+   - Every edge creation/strengthening normalized ALL edges
+   - More edges = lower weights for all (dilution)
+   - Example: 10 edges → each gets 0.1 weight (normalized)
+
+2. Learning rate based on error_rate (wrong variable)
+   - error_rate requires feedback (comparing output to target)
+   - But system needs to learn WITHOUT feedback at this stage
+   - Wrong relationship: learning_rate = f(error_rate) when no feedback exists
+
+SOLUTIONS IMPLEMENTED:
+----------------------
+
+1. REMOVED EDGE NORMALIZATION
+   - Edges now self-adjust through:
+     * Usage: More use = stronger (natural growth)
+     * Success: Correct predictions = stronger (when feedback exists)
+     * Competition: Strong edges get more activation = stronger (circular)
+     * Pruning: Weak edges get pruned (metabolic pressure)
+   
+   - Edge growth formula:
+     growth_rate = base_growth × (1 + usage_boost) × success_boost
+     - Base growth: 0.1 × learning_rate × port_penalty
+     - Usage boost: log(1 + use_count) / 10
+     - Success boost: 1.0 + (success_rate × 2.0)
+   
+   - New edges start at 0.5 (not 0.1)
+   - Weights can grow up to 10.0 (strong edges)
+   - No normalization - graph self-regulates!
+
+2. USAGE-BASED LEARNING RATE
+   - Changed from: learning_rate = f(error_rate²)
+   - Changed to: learning_rate = f(usage_pressure, exploration_pressure)
+   
+   - Formula:
+     learning_rate = 0.3 + (usage_pressure × 0.3) + (exploration × 0.2)
+     - Usage pressure: Average edge usage (log scale, normalized)
+     - Exploration pressure: Need to explore (from system state)
+   
+   - Why this works:
+     * High usage = system is active = learn faster
+     * Low usage = system is inactive = learn slower
+     * Exploration = need to explore = learn faster
+     * No feedback needed - self-regulating!
+
+3. IMPROVED EDGE STRENGTHENING
+   - Growth rate now depends on:
+     * Usage (more use = faster growth)
+     * Success rate (correct = faster growth)
+     * Learning rate (usage-based, not error-based)
+   
+   - Self-adjusting: Stronger edges grow faster (rich get richer)
+   - But capped to prevent explosion (max 50% growth per use)
+
+KEY INSIGHTS:
+-------------
+- Normalization prevents self-adjustment (forces all edges to sum to 1.0)
+- Without normalization, edges compete naturally through usage and success
+- Learning rate should reflect system activity (usage), not error (requires feedback)
+- The graph self-regulates through:
+  * Competition (strong edges win)
+  * Pruning (weak edges removed)
+  * Usage (active paths strengthen)
+  * Success (correct paths strengthen)
+
+EXPECTED RESULTS:
+-----------------
+- Edge weights should grow naturally (not diluted by normalization)
+- Sequential edges (c→a→t) should get strong weights (~1.0-10.0)
+- System learns faster when active (usage-based learning rate)
+- No feedback needed - self-adjusting through usage and competition
+

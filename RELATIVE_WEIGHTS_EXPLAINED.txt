@@ -1,0 +1,69 @@
+RELATIVE EDGE WEIGHTS (No Global Normalization)
+================================================
+
+PROBLEM:
+--------
+- Global normalization dilutes weights instantly
+- More edges = lower weights for all (forced to sum to 1.0)
+- Example: Node 'c' has 10 edges → each gets 0.1 weight (normalized)
+- This prevents self-adjustment - edges can't grow independently
+
+SOLUTION:
+---------
+Weight represents: "How STRONG is this edge relative to other edges FROM THIS SOURCE NODE?"
+
+NOT: "What proportion of all edges globally does this represent?"
+
+IMPLEMENTATION:
+--------------
+
+1. NO GLOBAL NORMALIZATION
+   - Edges grow independently through usage and success
+   - Weights can be any positive value (0.5, 1.0, 5.0, 10.0, etc.)
+   - No forced sum to 1.0
+
+2. RELATIVE COMPARISON (when selecting from a node)
+   - Get max weight from source node: max_weight = max(all edges from node)
+   - Compare relatively: relative_weight = edge.weight / max_weight
+   - This makes weights relative to the node's context, not globally
+
+3. EDGE GROWTH (self-adjusting)
+   - Base growth: 0.1 × learning_rate × port_penalty
+   - Usage boost: log(1 + use_count) / 10
+   - Success boost: 1.0 + (success_rate × 2.0)
+   - Growth: base × (1 + usage) × success
+   - No normalization after growth - weights grow independently
+
+4. SELECTION (relative to source node)
+   - For each edge from source node:
+     * relative_weight = edge.weight / max_weight_from_node
+     * usage_boost = log(1 + use_count) / 5
+     * success_boost = 1.0 + success_rate
+     * score = relative_weight × (1 + usage) × success
+   - Select edge with highest score
+   - This compares edges RELATIVE to the source node, not globally
+
+EXAMPLE:
+--------
+Node 'c' has edges:
+  c→a: weight=5.0, use=100, success=0.9
+  c→t: weight=2.0, use=50, success=0.8
+  c→d: weight=0.5, use=10, success=0.3
+
+Max weight from 'c' = 5.0
+
+Relative comparison:
+  c→a: relative=1.0, usage=0.92, success=1.9 → score=1.75
+  c→t: relative=0.4, usage=0.78, success=1.8 → score=0.56
+  c→d: relative=0.1, usage=0.40, success=1.3 → score=0.05
+
+Select c→a (highest relative score)
+
+KEY INSIGHT:
+------------
+- Weight = absolute strength (can grow unbounded)
+- Selection = relative comparison (weight / max_from_node)
+- No global normalization = edges grow independently
+- Relative comparison = weights meaningful within node's context
+- Self-adjustment = strong edges grow, weak edges stay weak or get pruned
+

@@ -1,0 +1,58 @@
+TEST RESULTS: BEFORE vs AFTER FIXES
+====================================
+
+BEFORE FIXES (Original System):
+--------------------------------
+Simple tests: 5/5 correct (100%)
+  ✓ cat -> cat (Sample 1)
+  ✓ dog -> dog (Sample 2)
+  ✓ bat -> bat (Sample 3)
+  ✓ rat -> rat (Sample 4)
+  ✓ hat -> hat (Sample 5)
+
+Complex tests: 0/13 correct (0%)
+  ✗ All complex tests failed (loops, wrong outputs)
+
+Issues:
+  - Meaning showed "inf" (overflow)
+  - Complex tests failed (expected)
+  - Simple tests worked perfectly
+
+AFTER FIXES (Current System):
+------------------------------
+Simple tests: 2/13 correct (15.4%) ⚠️ REGRESSION
+  ✓ cat -> cat (Sample 1)
+  ✗ dog -> dtc (Sample 2) - WRONG
+  ✗ bat -> bgt (Sample 3) - WRONG
+  ✗ rat -> rct (Sample 4) - WRONG
+  ✓ hat -> hat (Sample 5)
+
+Complex tests: 0/13 correct (0%) - No change
+  ✗ All complex tests still fail
+
+Improvements:
+  ✓ Meaning overflow fixed (no more "inf")
+  ✓ Pattern-guided selection active
+  ✓ Loop suppression improved
+
+PROBLEM IDENTIFIED:
+-------------------
+The pattern-guided selection is INTERFERING with simple edge-based paths!
+
+When patterns aren't well-learned yet, pattern predictions are WRONG,
+but the system prioritizes them over correct edge-based paths.
+
+Example: "dog" -> "dtc" instead of "dog"
+  - Pattern might predict 'd' -> 't' (wrong)
+  - Edge path 'd' -> 'o' -> 'g' (correct) is ignored
+  - Pattern score beats edge score even when pattern is wrong
+
+SOLUTION NEEDED:
+----------------
+Pattern-guided selection should only activate when:
+  1. Patterns are CONFIDENT (pattern_confidence > threshold)
+  2. Pattern predictions have HIGH strength
+  3. Pattern matches are STRONG
+
+Otherwise, fall back to edge-based selection (which worked for simple tests).
+
