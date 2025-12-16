@@ -1244,13 +1244,9 @@ void propagate_pattern_activation(MelvinGraph *g) {
                         /* INTELLIGENT PATH: Patterns are learned paths - follow them STRONGLY */
                         /* Patterns are learned intelligence - they predict where activation should go */
                         /* Transfer based on pattern activation, prediction weight, and pattern strength */
+                        /* Patterns start at 1.0 weight, so no artificial boost needed */
                         float transfer = pat->activation * weight * pat->strength;
-                        
-                        /* STRONG BOOST: Patterns are learned intelligence, not random */
-                        /* Active patterns = intelligent paths = strong activation boost */
-                        /* This is the key: patterns guide activation to correct nodes */
-                        float intelligent_path_boost = 3.0f;  /* Strong boost for pattern predictions */
-                        transfer *= intelligent_path_boost;
+                        /* No boost - pattern weight is already 1.0 (full strength) */
                         
                         g->nodes[target_node].activation += transfer;
                         g->nodes[target_node].receive_count++;
@@ -4940,95 +4936,30 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
         }
     }
     
-    /* OPTIMIZATION: Skip expensive pattern detection for chat mode (no target) */
-    /* Only do learning operations when we have a target to learn from */
+    /* SUPERVISED LEARNING ONLY: Only learn when target is provided */
+    /* We don't want unsupervised learning - only learn what we explicitly teach */
     if (target != NULL && target_len > 0) {
-        /* Training mode: Do full learning */
-        /* Detect patterns in the data we just saw */
-        detect_patterns(g);
+        /* SUPERVISED LEARNING: Learn INPUT→TARGET mappings only */
         
-        /* SELF-SUPERVISED LEARNING: Learn sequences from ALL DATA (input, output, target) */
-        /* The data IS the answer key - learn sequences from whatever data we see */
-        /* Helper function to learn from a sequence buffer */
-        void learn_from_sequence(uint32_t *buffer, uint32_t buffer_len) {
-            for (uint32_t p = 0; p < g->pattern_count; p++) {
-                Pattern *pat = &g->patterns[p];
-                if (pat->length == 0) continue;
-                
-                /* Check if pattern matches anywhere in this sequence */
-                for (uint32_t pos = 0; pos + pat->length < buffer_len; pos++) {
-                    if (pattern_matches(g, p, buffer, buffer_len, pos)) {
-                        /* Pattern matched! Learn what comes next */
-                        uint32_t next_pos = pos + pat->length;
-                        if (next_pos < buffer_len) {
-                            uint32_t next_node = buffer[next_pos];
-                            
-                            /* Add or strengthen prediction */
-                            bool found = false;
-                            for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
-                                if (pat->predicted_nodes[pred] == next_node) {
-                                    pat->prediction_weights[pred] += 0.3f * g->state.learning_rate;
-                                    if (pat->prediction_weights[pred] > 1.0f) pat->prediction_weights[pred] = 1.0f;
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            
-                            if (!found) {
-                                if (pat->prediction_count == 0) {
-                                    pat->predicted_nodes = malloc(sizeof(uint32_t) * 4);
-                                    pat->prediction_weights = malloc(sizeof(float) * 4);
-                                    pat->prediction_count = 0;
-                                } else if (pat->prediction_count % 4 == 0) {
-                                    pat->predicted_nodes = realloc(pat->predicted_nodes, 
-                                                                   sizeof(uint32_t) * (pat->prediction_count + 4));
-                                    pat->prediction_weights = realloc(pat->prediction_weights,
-                                                                      sizeof(float) * (pat->prediction_count + 4));
-                                }
-                                pat->predicted_nodes[pat->prediction_count] = next_node;
-                                pat->prediction_weights[pat->prediction_count] = 0.5f * g->state.learning_rate;
-                                pat->prediction_count++;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        /* Learn from INPUT data */
-        learn_from_sequence(g->input_buffer, g->input_length);
-        
-        /* Learn from OUTPUT data (what we generated) */
-        if (g->output_length > 0) {
-            learn_from_sequence(g->output_buffer, g->output_length);
-        }
-        
-        /* Learn from TARGET data (the answer key) */
-        if (target != NULL && target_len > 0) {
-            uint32_t target_nodes[256];
-            uint32_t target_node_len = (target_len < 256) ? target_len : 256;
-            for (uint32_t i = 0; i < target_node_len; i++) {
-                target_nodes[i] = target[i];
-            }
-            learn_from_sequence(target_nodes, target_node_len);
-        }
-        
-        /* Detect generalized patterns (with blank nodes for generalization) */
-        detect_generalized_patterns(g);
-        
-        /* ACTIVE GENERALIZATION: Patterns try to create blank node variants to explore connections */
-        /* This is how patterns "try out connections" - they generalize themselves */
-        actively_generalize_patterns(g);
-        
-        /* EXPLORE CONNECTIONS: Patterns try blank node substitutions to find connections */
-        /* Patterns with high activation but few connections actively explore */
-        explore_pattern_connections(g);
-        
-        /* Learn pattern predictions (what comes after each pattern) */
+        /* Learn pattern predictions from target (supervised) */
         learn_pattern_predictions(g, target, target_len);
         
-        /* Apply feedback */
+        /* Create direct input→target edges (supervised) */
+        /* This creates explicit INPUT→TARGET associations */
+        for (uint32_t i = 0; i < g->input_length && i < target_len; i++) {
+            create_or_strengthen_edge(g, g->input_buffer[i], target[i]);
+        }
+        
+        /* Apply feedback (strengthen correct, weaken incorrect) */
         apply_feedback(g, target, target_len);
+        
+        /* REMOVED: Unsupervised learning (we only want supervised) */
+        /* - detect_patterns() - unsupervised pattern detection */
+        /* - learn_from_sequence() - learns from data without target */
+        /* - detect_generalized_patterns() - unsupervised generalization */
+        /* - actively_generalize_patterns() - unsupervised exploration */
+        /* - explore_pattern_connections() - unsupervised exploration */
+        /* We only learn what we explicitly teach with INPUT→TARGET pairs */
     } else {
         /* Chat mode: Skip expensive learning, just respond quickly */
         /* Only do minimal pattern detection if system is very new */
@@ -5185,7 +5116,7 @@ void learn_pattern_predictions(MelvinGraph *g, const uint8_t *target, uint32_t t
                             }
                             
                             pat->predicted_nodes[pat->prediction_count] = target_node;
-                            pat->prediction_weights[pat->prediction_count] = 0.8f;  /* Strong initial weight */
+                            pat->prediction_weights[pat->prediction_count] = 1.0f;  /* Full strength when learned from target */
                             pat->prediction_count++;
                         }
                     }
