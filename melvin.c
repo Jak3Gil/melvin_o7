@@ -3829,9 +3829,10 @@ uint32_t select_output_node(MelvinGraph *g) {
     float best_score = 0.0f;
     
     /* STEP 1: Check pattern predictions (pattern-guided intelligence) */
-    /* ONLY use patterns when they're CONFIDENT - otherwise fall back to edges */
-    /* This prevents wrong pattern predictions from breaking simple edge-based paths */
-    if (g->output_length > 0 && g->state.pattern_confidence > 0.5f) {
+    /* Patterns find meaning from highest level (deeper hierarchy = more meaning) */
+    /* Input is just a spark - patterns guide the wave based on accumulated meaning */
+    /* Prioritize patterns with higher accumulated_meaning (they have more understanding) */
+    if (g->output_length > 0) {
         /* Only use pattern-guided selection when patterns are reliable */
         for (uint32_t p = 0; p < g->pattern_count; p++) {
             Pattern *pat = &g->patterns[p];
@@ -3855,10 +3856,24 @@ uint32_t select_output_node(MelvinGraph *g) {
                             /* Calculate pattern-guided score */
                             float pattern_score = pat->strength * pat->activation * pred_weight;
                             
-                            /* Boost by pattern confidence (only when high) */
-                            if (g->state.pattern_confidence > 0.7f) {
-                                pattern_score *= 2.0f;  /* Strong boost when patterns are reliable */
+                            /* MEANING FROM HIGHEST LEVEL: Patterns with accumulated_meaning guide output */
+                            /* Deeper hierarchy = more meaning = stronger influence */
+                            /* This is how meaning emerges - not from input, but from pattern hierarchies */
+                            float meaning_boost = 1.0f;
+                            if (pat->accumulated_meaning > 0.1f) {
+                                float bounded_meaning = pat->accumulated_meaning;
+                                if (bounded_meaning > 100.0f) {
+                                    bounded_meaning = 100.0f + logf(bounded_meaning / 100.0f) * 10.0f;
+                                }
+                                if (bounded_meaning > 200.0f) bounded_meaning = 200.0f;
+                                meaning_boost = 1.0f + (bounded_meaning * 0.5f);
+                                if (meaning_boost > 30.0f) meaning_boost = 30.0f;
                             }
+                            
+                            /* HIERARCHY BOOST: Deeper patterns (more abstract) have more meaning */
+                            float hierarchy_boost = 1.0f + (1.0f / (1.0f + pat->chain_depth * 0.2f));
+                            
+                            pattern_score *= meaning_boost * hierarchy_boost;
                             
                             /* Add node activation (wave propagation support) */
                             pattern_score += g->nodes[predicted_node].activation * 0.5f;
@@ -3902,13 +3917,10 @@ uint32_t select_output_node(MelvinGraph *g) {
         }
     }
     
-    /* STEP 2: Input-guided selection (when output is empty or incomplete) */
-    /* Prioritize input sequence - edges should FOLLOW input, not replace it */
-    if (selected_node >= BYTE_VALUES && g->output_length < g->input_length) {
-        /* Use input at current position (input sequence guides output) */
-        selected_node = g->input_buffer[g->output_length];
-        source_node = BYTE_VALUES;  /* Input-guided, no edge source */
-    }
+    /* STEP 2: Pattern-guided selection (patterns find meaning, not input echo) */
+    /* Input is just a spark - patterns guide the wave based on meaning */
+    /* Meaning comes from highest level patterns (deeper hierarchy = more meaning) */
+    /* Skip input echo - let patterns with meaning guide output */
     
     /* STEP 3: Greedy edge following (when output exists, follow edges) */
     if (selected_node >= BYTE_VALUES && g->output_length > 0) {
@@ -3987,9 +3999,18 @@ uint32_t select_output_node(MelvinGraph *g) {
         }
     }
     
-    /* STEP 4: Final fallback: Return first input node */
-    if (selected_node >= BYTE_VALUES && g->input_length > 0) {
-        selected_node = g->input_buffer[0];
+    /* STEP 4: Final fallback: Use highest activation node (wave propagation result) */
+    /* Don't echo input - let wave propagation and patterns guide output */
+    /* Input is just a spark, meaning comes from patterns */
+    if (selected_node >= BYTE_VALUES) {
+        /* Find node with highest activation from wave propagation */
+        float max_activation = 0.0f;
+        for (int i = 0; i < BYTE_VALUES; i++) {
+            if (g->nodes[i].exists && g->nodes[i].activation > max_activation) {
+                max_activation = g->nodes[i].activation;
+                selected_node = i;
+            }
+        }
     }
     
     /* TRACK CONTRIBUTION: Record which edge led to this selection */
@@ -4850,14 +4871,15 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
     /* Wave prop needs current system state (avg_activation, etc.) */
     compute_system_state(g);
     
-    /* Ensure input nodes have strong activation to start wave */
-    /* Input nodes should be the source of activation flow */
+    /* INPUT AS SPARK: Just initiate wave propagation, don't dominate it */
+    /* Input is a spark that tells wave prop where to go */
+    /* Meaning comes from patterns (especially highest level patterns) */
     for (uint32_t i = 0; i < input_len && i < g->input_length; i++) {
         uint32_t node_id = g->input_buffer[i];
         if (node_id < BYTE_VALUES && g->nodes[node_id].exists) {
-            /* Boost input node activation - these are the wave sources */
-            g->nodes[node_id].activation = 0.8f;  /* Strong initial activation */
-            /* Activation is purely local, no energy constraint */
+            /* Spark activation - just enough to start the wave */
+            g->nodes[node_id].activation = 0.2f;  /* Spark, not dominant */
+            /* Wave propagation will follow close connections and find meaning from patterns */
         }
     }
     
