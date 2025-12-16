@@ -212,6 +212,30 @@ typedef struct {
     float suppression_strength;         /* How strongly this pattern suppresses others */
     float boost_strength;                /* How strongly this pattern boosts others */
     
+    /* ========================================================================
+     * LEARNED PROPAGATION & SELECTION PARAMETERS (DATA-DRIVEN)
+     * Patterns learn HOW to propagate and HOW to select from raw data
+     * Like transistors - complexity comes from connections and activation patterns
+     * ======================================================================== */
+    
+    /* PROPAGATION PARAMETERS: Learned from data, control how activation transfers */
+    float propagation_transfer_rate;    /* How much activation to transfer (learned from data) */
+    float propagation_decay_rate;        /* How fast activation decays (learned from data) */
+    float propagation_threshold;         /* Minimum activation to propagate (learned from data) */
+    float propagation_boost_factor;      /* Boost for pattern-predicted paths (learned from data) */
+    
+    /* SELECTION PARAMETERS: Learned from data, control how edges are selected */
+    float selection_weight_factor;       /* How much edge weight matters (learned from data) */
+    float selection_activation_factor;   /* How much node activation matters (learned from data) */
+    float selection_context_factor;      /* How much context matters (learned from data) */
+    float selection_pattern_factor;      /* How much pattern predictions matter (learned from data) */
+    
+    /* LEARNING TRACKING: Track what works for this pattern */
+    uint32_t propagation_attempts;      /* How many times pattern tried to propagate */
+    uint32_t propagation_successes;     /* How many times propagation led to correct output */
+    uint32_t selection_attempts;         /* How many times pattern tried to select */
+    uint32_t selection_successes;       /* How many times selection led to correct output */
+    
 } Pattern;
 
 /* ============================================================================
@@ -242,6 +266,23 @@ void initialize_pattern_enhancements(Pattern *pat) {
     pat->rule_strengths = NULL;
     pat->rule_count = 0;
     pat->rule_capacity = 0;
+    
+    /* Initialize learned propagation & selection parameters */
+    /* Start with reasonable defaults, learn from data */
+    pat->propagation_transfer_rate = 0.5f;      /* Start: transfer 50% of activation */
+    pat->propagation_decay_rate = 0.9f;        /* Start: 90% retention */
+    pat->propagation_threshold = 0.1f;          /* Start: propagate if activation > 0.1 */
+    pat->propagation_boost_factor = 1.0f;       /* Start: no boost */
+    
+    pat->selection_weight_factor = 0.4f;       /* Start: weight matters 40% */
+    pat->selection_activation_factor = 0.3f;    /* Start: activation matters 30% */
+    pat->selection_context_factor = 0.2f;       /* Start: context matters 20% */
+    pat->selection_pattern_factor = 0.1f;       /* Start: patterns matter 10% */
+    
+    pat->propagation_attempts = 0;
+    pat->propagation_successes = 0;
+    pat->selection_attempts = 0;
+    pat->selection_successes = 0;
 }
 
 /* ============================================================================
@@ -382,6 +423,7 @@ void melvin_destroy(MelvinGraph *g);
 bool pattern_matches(MelvinGraph *g, uint32_t pattern_id, const uint32_t *sequence, uint32_t seq_len, uint32_t start_pos);
 float pattern_forward_pass(MelvinGraph *g, uint32_t pattern_id, const uint32_t *input_nodes, uint32_t input_len);
 void propagate_pattern_activation(MelvinGraph *g);
+void learn_propagation_selection_parameters(MelvinGraph *g, const uint8_t *target, uint32_t target_len);
 void detect_generalized_patterns(MelvinGraph *g);
 void learn_pattern_predictions(MelvinGraph *g, const uint8_t *target, uint32_t target_len);
 void learn_pattern_sequences_automatic(MelvinGraph *g);
@@ -2802,7 +2844,29 @@ void propagate_activation(MelvinGraph *g) {
             /* Transfer activation proportional to path quality (normalized) */
             /* Better paths get more activation, but all paths get some if quality > 0 */
             float normalized_quality = path_qualities[j] * soft_normalization;
-            float transfer = g->nodes[i].activation * normalized_quality;
+            
+            /* DATA-DRIVEN PROPAGATION: Use pattern-learned transfer rate */
+            /* Check if any pattern controls this edge */
+            float learned_transfer_rate = 1.0f;  /* Default: full transfer */
+            uint32_t controlling_pattern = INVALID_PATTERN_ID;
+            
+            for (uint32_t p = 0; p < g->pattern_count; p++) {
+                Pattern *pat = &g->patterns[p];
+                if (pat->activation > pat->threshold && pat->activation_control_strength > 0.2f) {
+                    /* Check if this edge is part of pattern */
+                    for (uint32_t pat_idx = 0; pat_idx < pat->length - 1; pat_idx++) {
+                        if (pat->node_ids[pat_idx] == i && pat->node_ids[pat_idx + 1] == target) {
+                            /* Pattern controls this edge - use its learned transfer rate */
+                            learned_transfer_rate = pat->propagation_transfer_rate;
+                            controlling_pattern = p;
+                            break;
+                        }
+                    }
+                    if (controlling_pattern != INVALID_PATTERN_ID) break;
+                }
+            }
+            
+            float transfer = g->nodes[i].activation * normalized_quality * learned_transfer_rate;
             
             /* SELF-REGULATION: Cap transfer to prevent explosion, but allow high activation for important things */
             if (transfer > 10.0f) transfer = 10.0f;  /* Cap to prevent explosion */
@@ -2834,8 +2898,25 @@ void propagate_activation(MelvinGraph *g) {
         }
         
         /* Source node activation decays after propagating (like signal attenuation) */
-        /* But don't decay too much - activation should accumulate along paths */
-        g->nodes[i].activation *= 0.9f;  /* Slight decay (signal weakens as it propagates) */
+        /* DATA-DRIVEN DECAY: Use pattern-learned decay rate */
+        float learned_decay_rate = 0.9f;  /* Default decay */
+        
+        /* Find pattern that best matches this node's context */
+        for (uint32_t p = 0; p < g->pattern_count; p++) {
+            Pattern *pat = &g->patterns[p];
+            if (pat->activation > pat->threshold) {
+                /* Check if pattern contains this node */
+                for (uint32_t pat_idx = 0; pat_idx < pat->length; pat_idx++) {
+                    if (pat->node_ids[pat_idx] == i) {
+                        /* Use this pattern's learned decay rate */
+                        learned_decay_rate = pat->propagation_decay_rate;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        g->nodes[i].activation *= learned_decay_rate;  /* Pattern-learned decay */
         g->nodes[i].fire_count++;
     }
     
@@ -3832,20 +3913,46 @@ uint32_t select_output_node(MelvinGraph *g) {
     /* Patterns find meaning from highest level (deeper hierarchy = more meaning) */
     /* Input is just a spark - patterns guide the wave based on accumulated meaning */
     /* Prioritize patterns with higher accumulated_meaning (they have more understanding) */
-    if (g->output_length > 0) {
-        /* Only use pattern-guided selection when patterns are reliable */
+    
+    /* CRITICAL FIX: Check INPUT context when output is empty, OUTPUT context when output exists */
+    bool check_patterns = (g->output_length > 0) || (g->input_length > 0);
+    
+    if (check_patterns) {
+        /* Use pattern-guided selection - match INPUT when output empty, OUTPUT when output exists */
         for (uint32_t p = 0; p < g->pattern_count; p++) {
             Pattern *pat = &g->patterns[p];
             
             /* Pattern must be strong enough to trust */
             if (pat->strength < 0.3f) continue;  /* Skip weak patterns */
             
-            /* Check if pattern matches end of current output */
-            if (g->output_length >= pat->length && pat->prediction_count > 0) {
+            bool pattern_matches_context = false;
+            uint32_t *match_sequence = NULL;
+            uint32_t match_start_pos = 0;
+            
+            if (g->output_length > 0 && g->output_length >= pat->length) {
+                /* Match OUTPUT context (continuation) */
                 uint32_t start_pos = g->output_length - pat->length;
                 if (pattern_matches(g, p, g->output_buffer, g->output_length, start_pos)) {
-                    /* Pattern matches! Check its predictions */
-                    for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
+                    pattern_matches_context = true;
+                    match_sequence = g->output_buffer;
+                    match_start_pos = start_pos;
+                }
+            } else if (g->output_length == 0 && g->input_length >= pat->length) {
+                /* Match INPUT context (first selection) - CRITICAL FIX */
+                /* Try matching from end of input (most relevant) */
+                for (int pos = g->input_length - pat->length; pos >= 0; pos--) {
+                    if (pattern_matches(g, p, g->input_buffer, g->input_length, pos)) {
+                        pattern_matches_context = true;
+                        match_sequence = g->input_buffer;
+                        match_start_pos = pos;
+                        break;  /* Use most recent match */
+                    }
+                }
+            }
+            
+            if (pattern_matches_context && pat->prediction_count > 0) {
+                /* Pattern matches! Check its predictions */
+                for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
                         uint32_t predicted_node = pat->predicted_nodes[pred];
                         float pred_weight = pat->prediction_weights[pred];
                         
@@ -3915,21 +4022,15 @@ uint32_t select_output_node(MelvinGraph *g) {
                 }
             }
         }
-    }
     
-    /* STEP 2: Pattern-guided selection (patterns find meaning, not input echo) */
-    /* Input is just a spark - patterns guide the wave based on meaning */
-    /* Meaning comes from highest level patterns (deeper hierarchy = more meaning) */
-    /* Skip input echo - let patterns with meaning guide output */
-    
-    /* STEP 3: Greedy edge following (when output exists, follow edges) */
+    /* STEP 3: Pattern-driven edge selection (patterns generate rules based on context) */
+    /* Patterns = edges + nodes that create meaning - they generate if-statements dynamically */
     if (selected_node >= BYTE_VALUES && g->output_length > 0) {
         /* Follow from previous output */
         uint32_t prev_output = g->output_buffer[g->output_length - 1];
         if (prev_output < BYTE_VALUES) {
             EdgeList *edges = &g->outgoing[prev_output];
             
-            /* Find strongest edge using RELATIVE weights (relative to source node) */
             /* Get max weight from this node for relative comparison */
             float max_weight_from_node = 0.0f;
             for (uint32_t j = 0; j < edges->count; j++) {
@@ -3945,37 +4046,208 @@ uint32_t select_output_node(MelvinGraph *g) {
                 Edge *e = &edges->edges[i];
                 uint32_t candidate = e->to_id;
                 
-                /* RELATIVE WEIGHT: Compare to max from this node (not global) */
+                /* ========================================================================
+                 * PATTERN-DRIVEN EDGE SCORING: Patterns generate rules based on context
+                 * Patterns evaluate: node activations, edge states, context → edge score
+                 * This replaces hardcoded if-statements with dynamic pattern rules
+                 * ======================================================================== */
+                
+                float edge_score = 0.0f;
+                float pattern_contributions = 0.0f;
+                uint32_t pattern_count_contributing = 0;
+                
+                /* Let patterns evaluate this edge based on context */
+                for (uint32_t p = 0; p < g->pattern_count; p++) {
+                    Pattern *pat = &g->patterns[p];
+                    
+                    /* Pattern must be active and have control authority */
+                    if (pat->activation <= pat->threshold || pat->activation_control_strength < 0.2f) {
+                        continue;
+                    }
+                    
+                    /* Pattern evaluates edge based on context:
+                     * - Does pattern predict this candidate node?
+                     * - Does pattern match current output context?
+                     * - What is the pattern's confidence in this edge?
+                     */
+                    
+                    bool pattern_predicts_candidate = false;
+                    float prediction_weight = 0.0f;
+                    
+                    /* Check if pattern predicts this candidate */
+                    for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
+                        if (pat->predicted_nodes[pred] == candidate) {
+                            pattern_predicts_candidate = true;
+                            prediction_weight = pat->prediction_weights[pred];
+                            break;
+                        }
+                    }
+                    
+                    /* Check if pattern matches current context (output end) */
+                    bool pattern_matches_context = false;
+                    if (g->output_length >= pat->length) {
+                        uint32_t start_pos = g->output_length - pat->length;
+                        if (pattern_matches(g, p, g->output_buffer, g->output_length, start_pos)) {
+                            pattern_matches_context = true;
+                        }
+                    }
+                    
+                    /* Pattern generates rule: IF context matches AND predicts candidate THEN boost */
+                    if (pattern_matches_context && pattern_predicts_candidate) {
+                        /* Pattern rule: boost this edge based on pattern confidence */
+                        float pattern_rule_score = pat->activation * prediction_weight * 
+                                                   pat->strength * pat->rule_confidence;
+                        pattern_contributions += pattern_rule_score;
+                        pattern_count_contributing++;
+                    }
+                }
+                
+                /* DATA-DRIVEN SELECTION: Use pattern-learned selection factors */
+                /* Find pattern that best controls this edge selection */
+                float weight_factor = 0.4f;  /* Default factors */
+                float activation_factor = 0.3f;
+                float context_factor = 0.2f;
+                float pattern_factor = 0.1f;
+                uint32_t controlling_pattern = INVALID_PATTERN_ID;
+                
+                for (uint32_t p = 0; p < g->pattern_count; p++) {
+                    Pattern *pat = &g->patterns[p];
+                    if (pat->activation > pat->threshold && pat->activation_control_strength > 0.2f) {
+                        /* Check if pattern matches context and predicts candidate */
+                        bool matches = false;
+                        if (g->output_length >= pat->length) {
+                            uint32_t start_pos = g->output_length - pat->length;
+                            if (pattern_matches(g, p, g->output_buffer, g->output_length, start_pos)) {
+                                matches = true;
+                            }
+                        }
+                        for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
+                            if (pat->predicted_nodes[pred] == candidate && matches) {
+                                /* Pattern controls this selection - use its learned factors */
+                                weight_factor = pat->selection_weight_factor;
+                                activation_factor = pat->selection_activation_factor;
+                                context_factor = pat->selection_context_factor;
+                                pattern_factor = pat->selection_pattern_factor;
+                                controlling_pattern = p;
+                                break;
+                            }
+                        }
+                        if (controlling_pattern != INVALID_PATTERN_ID) break;
+                    }
+                }
+                
+                /* Base edge score from edge properties (using learned factors) */
                 float relative_weight = e->weight / max_weight_from_node;
-                
-                /* Usage boost (log scale) */
                 float usage_boost = logf(1.0f + e->use_count) / 5.0f;
-                
-                /* Success boost */
                 float success_rate = (e->use_count > 0) ? 
                     ((float)e->success_count / (float)e->use_count) : 0.0f;
                 float success_boost = 1.0f + success_rate;
                 
-                /* Edge score = relative weight × usage × success */
-                float edge_score = relative_weight * (1.0f + usage_boost) * success_boost;
+                /* Base score = weighted combination using learned factors */
+                float base_score = (relative_weight * weight_factor) + 
+                                  ((1.0f + usage_boost) * weight_factor * 0.5f) +
+                                  (success_boost * weight_factor * 0.5f);
                 
-                /* Add node activation support */
+                /* Add node activation support (using learned activation factor) */
+                float activation_contribution = 0.0f;
                 if (candidate < BYTE_VALUES && g->nodes[candidate].exists) {
-                    edge_score += g->nodes[candidate].activation * 0.3f;
+                    activation_contribution = g->nodes[candidate].activation * activation_factor;
                 }
                 
-                /* Suppress looping nodes */
-                float loop_penalty = 1.0f;
-                if (g->output_length >= 2 && candidate == g->output_buffer[g->output_length - 2]) {
-                    loop_penalty = 0.1f;
+                /* Pattern contributions (using learned pattern factor) */
+                float pattern_contribution = 0.0f;
+                if (pattern_count_contributing > 0) {
+                    float avg_pattern_contribution = pattern_contributions / pattern_count_contributing;
+                    pattern_contribution = avg_pattern_contribution * pattern_factor;
                 }
-                if (g->output_length >= 3 && candidate == g->output_buffer[g->output_length - 3]) {
-                    loop_penalty = 0.2f;
+                
+                /* Context contribution (using learned context factor) */
+                /* Context = how well this edge fits current input/output context */
+                float context_contribution = 0.0f;
+                
+                if (g->output_length == 0 && g->input_length > 0) {
+                    /* FIRST SELECTION: Check if candidate is next in INPUT sequence */
+                    /* This is critical - different inputs should select different first nodes */
+                    for (uint32_t i = 0; i < g->input_length; i++) {
+                        if (g->input_buffer[i] == candidate) {
+                            /* Candidate is in input - check if it's the RIGHT position */
+                            float position_relevance = 1.0f;
+                            
+                            /* If we're at position i in input, candidate should be at position i */
+                            /* Boost if candidate matches input sequence position */
+                            if (i == 0) {
+                                /* First character - strong boost */
+                                context_contribution = context_factor * 2.0f;
+                            } else {
+                                /* Later in sequence - check if it follows from previous */
+                                uint32_t prev_input = g->input_buffer[i - 1];
+                                if (prev_output == prev_input) {
+                                    /* Follows input sequence - strong boost */
+                                    context_contribution = context_factor * 1.5f;
+                                } else {
+                                    /* In input but not sequential - moderate boost */
+                                    context_contribution = context_factor * 0.5f;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                } else if (g->output_length > 0) {
+                    /* CONTINUATION: Check if candidate follows output sequence */
+                    /* Check if candidate is next in input sequence (for completion) */
+                    if (g->input_length > g->output_length) {
+                        uint32_t next_input_pos = g->output_length;
+                        if (g->input_buffer[next_input_pos] == candidate) {
+                            /* Candidate is next in input sequence - strong boost */
+                            context_contribution = context_factor * 1.5f;
+                        }
+                    }
+                    
+                    /* Also check if candidate appears in input (contextual relevance) */
+                    bool in_input = false;
+                    for (uint32_t i = 0; i < g->input_length; i++) {
+                        if (g->input_buffer[i] == candidate) {
+                            in_input = true;
+                            break;
+                        }
+                    }
+                    if (in_input && context_contribution < 0.1f) {
+                        context_contribution = context_factor * 0.3f;  /* Moderate boost */
+                    }
+                }
+                
+                /* Final edge score = weighted combination of all factors */
+                edge_score = base_score + activation_contribution + pattern_contribution + context_contribution;
+                
+                /* Pattern-generated loop suppression (patterns learn to avoid loops) */
+                float loop_penalty = 1.0f;
+                bool pattern_suppresses_loop = false;
+                
+                /* Check if any pattern suppresses this candidate (patterns learn loop avoidance) */
+                for (uint32_t p = 0; p < g->pattern_count; p++) {
+                    Pattern *pat = &g->patterns[p];
+                    if (pat->activation > pat->threshold && pat->suppression_strength > 0.1f) {
+                        /* Pattern has learned to suppress loops - check if this is a loop */
+                        if (g->output_length >= 2 && candidate == g->output_buffer[g->output_length - 2]) {
+                            loop_penalty *= (1.0f - pat->suppression_strength * pat->rule_confidence);
+                            pattern_suppresses_loop = true;
+                        }
+                    }
+                }
+                
+                /* Fallback loop penalty if no pattern handles it */
+                if (!pattern_suppresses_loop) {
+                    if (g->output_length >= 2 && candidate == g->output_buffer[g->output_length - 2]) {
+                        loop_penalty = 0.1f;
+                    }
+                    if (g->output_length >= 3 && candidate == g->output_buffer[g->output_length - 3]) {
+                        loop_penalty = 0.2f;
+                    }
                 }
                 edge_score *= loop_penalty;
                 
-                /* Apply loop pressure */
-                if (g->state.loop_pressure > 0.3f) {
+                /* System-wide loop pressure (if patterns haven't learned to handle it) */
+                if (g->state.loop_pressure > 0.3f && !pattern_suppresses_loop) {
                     bool continues_loop = false;
                     if (g->output_length >= 3) {
                         for (uint32_t j = 0; j < 3 && j < g->output_length; j++) {
@@ -3999,16 +4271,34 @@ uint32_t select_output_node(MelvinGraph *g) {
         }
     }
     
-    /* STEP 4: Final fallback: Use highest activation node (wave propagation result) */
-    /* Don't echo input - let wave propagation and patterns guide output */
-    /* Input is just a spark, meaning comes from patterns */
+    /* STEP 4: Final fallback: Use context-aware selection */
+    /* CRITICAL FIX: When output is empty, use INPUT context, not just highest activation */
     if (selected_node >= BYTE_VALUES) {
-        /* Find node with highest activation from wave propagation */
-        float max_activation = 0.0f;
-        for (int i = 0; i < BYTE_VALUES; i++) {
-            if (g->nodes[i].exists && g->nodes[i].activation > max_activation) {
-                max_activation = g->nodes[i].activation;
-                selected_node = i;
+        if (g->output_length == 0 && g->input_length > 0) {
+            /* FIRST SELECTION: Use INPUT context - select first character of input */
+            /* Different inputs should produce different first outputs */
+            selected_node = g->input_buffer[0];
+            if (selected_node >= BYTE_VALUES || !g->nodes[selected_node].exists) {
+                /* Fallback: find node with highest activation that's in input */
+                float max_activation = 0.0f;
+                for (uint32_t i = 0; i < g->input_length; i++) {
+                    uint32_t input_node = g->input_buffer[i];
+                    if (input_node < BYTE_VALUES && g->nodes[input_node].exists) {
+                        if (g->nodes[input_node].activation > max_activation) {
+                            max_activation = g->nodes[input_node].activation;
+                            selected_node = input_node;
+                        }
+                    }
+                }
+            }
+        } else {
+            /* CONTINUATION: Use highest activation from wave propagation */
+            float max_activation = 0.0f;
+            for (int i = 0; i < BYTE_VALUES; i++) {
+                if (g->nodes[i].exists && g->nodes[i].activation > max_activation) {
+                    max_activation = g->nodes[i].activation;
+                    selected_node = i;
+                }
             }
         }
     }
@@ -4958,35 +5248,288 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
         }
     }
     
-    /* SUPERVISED LEARNING ONLY: Only learn when target is provided */
-    /* We don't want unsupervised learning - only learn what we explicitly teach */
+    /* ========================================================================
+     * SELF-SUPERVISED LEARNING: Data is the answer key
+     * Patterns check each other, learn from data structure, hierarchical validation
+     * Early corrections help bootstrap, but intelligence comes from data itself
+     * ======================================================================== */
+    
     if (target != NULL && target_len > 0) {
-        /* SUPERVISED LEARNING: Learn INPUT→TARGET mappings only */
-        
-        /* Learn pattern predictions from target (supervised) */
+        /* SUPERVISED LEARNING: Learn from explicit targets (early bootstrap) */
         learn_pattern_predictions(g, target, target_len);
         
-        /* Create direct input→target edges (supervised) */
-        /* This creates explicit INPUT→TARGET associations */
+        /* Create direct input→target edges */
         for (uint32_t i = 0; i < g->input_length && i < target_len; i++) {
             create_or_strengthen_edge(g, g->input_buffer[i], target[i]);
         }
         
-        /* Apply feedback (strengthen correct, weaken incorrect) */
+        /* Apply feedback */
         apply_feedback(g, target, target_len);
+    }
+    
+    /* SELF-SUPERVISED LEARNING: Always learn from data structure itself */
+    /* Data structure provides feedback - sequences, co-occurrence, patterns */
+    
+    /* 1. Learn from input sequence structure (data is answer key) */
+    if (g->input_length > 1) {
+        /* Learn sequential patterns from input */
+        for (uint32_t i = 0; i < g->input_length - 1; i++) {
+            /* Sequence structure: input[i] → input[i+1] is valid */
+            /* This is self-supervised - the sequence itself validates */
+            create_or_strengthen_edge(g, g->input_buffer[i], g->input_buffer[i+1]);
+        }
+    }
+    
+    /* 2. Learn from output sequence structure (what we generated) */
+    if (g->output_length > 1) {
+        /* Output sequence structure validates itself */
+        for (uint32_t i = 0; i < g->output_length - 1; i++) {
+            /* If output[i] → output[i+1] happened, it's valid structure */
+            create_or_strengthen_edge(g, g->output_buffer[i], g->output_buffer[i+1]);
+        }
+    }
+    
+    /* 3. Hierarchical validation: Higher patterns check lower patterns */
+    /* Patterns at deeper levels (more abstract) validate patterns at shallower levels */
+    for (uint32_t p1 = 0; p1 < g->pattern_count; p1++) {
+        Pattern *pat1 = &g->patterns[p1];
+        if (pat1->chain_depth == 0) continue;  /* Skip root patterns */
         
-        /* REMOVED: Unsupervised learning (we only want supervised) */
-        /* - detect_patterns() - unsupervised pattern detection */
-        /* - learn_from_sequence() - learns from data without target */
-        /* - detect_generalized_patterns() - unsupervised generalization */
-        /* - actively_generalize_patterns() - unsupervised exploration */
-        /* - explore_pattern_connections() - unsupervised exploration */
-        /* We only learn what we explicitly teach with INPUT→TARGET pairs */
-    } else {
-        /* Chat mode: Skip expensive learning, just respond quickly */
-        /* Only do minimal pattern detection if system is very new */
-        if (g->pattern_count < 10) {
-            detect_patterns(g);  /* Help bootstrap new system */
+        /* Find parent pattern */
+        if (pat1->parent_pattern_id < g->pattern_count) {
+            Pattern *parent = &g->patterns[pat1->parent_pattern_id];
+            
+            /* Parent validates child: if parent matches, child should match */
+            /* Check if parent's predictions include child's nodes */
+            bool parent_validates_child = false;
+            for (uint32_t pred = 0; pred < parent->prediction_count; pred++) {
+                for (uint32_t i = 0; i < pat1->length; i++) {
+                    if (parent->predicted_nodes[pred] == pat1->node_ids[i]) {
+                        parent_validates_child = true;
+                        break;
+                    }
+                }
+                if (parent_validates_child) break;
+            }
+            
+            if (parent_validates_child) {
+                /* Parent validates child - strengthen child */
+                pat1->strength = fmin(1.0f, pat1->strength + 0.01f * g->state.learning_rate);
+                pat1->prediction_successes++;  /* Hierarchical validation = success */
+            }
+        }
+    }
+    
+    /* 4. Pattern co-occurrence validation (patterns check each other) */
+    /* If patterns co-occur frequently, they validate each other */
+    for (uint32_t p1 = 0; p1 < g->pattern_count; p1++) {
+        Pattern *pat1 = &g->patterns[p1];
+        if (pat1->activation < pat1->threshold) continue;
+        
+        for (uint32_t p2 = p1 + 1; p2 < g->pattern_count; p2++) {
+            Pattern *pat2 = &g->patterns[p2];
+            if (pat2->activation < pat2->threshold) continue;
+            
+            /* Check if patterns co-occur in input/output */
+            bool co_occur = false;
+            
+            /* Check input */
+            if (g->input_length >= pat1->length + pat2->length) {
+                for (uint32_t pos = 0; pos <= g->input_length - pat1->length - pat2->length; pos++) {
+                    if (pattern_matches(g, p1, g->input_buffer, g->input_length, pos)) {
+                        if (pattern_matches(g, p2, g->input_buffer, g->input_length, pos + pat1->length)) {
+                            co_occur = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            /* Check output */
+            if (!co_occur && g->output_length >= pat1->length + pat2->length) {
+                for (uint32_t pos = 0; pos <= g->output_length - pat1->length - pat2->length; pos++) {
+                    if (pattern_matches(g, p1, g->output_buffer, g->output_length, pos)) {
+                        if (pattern_matches(g, p2, g->output_buffer, g->output_length, pos + pat1->length)) {
+                            co_occur = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            if (co_occur) {
+                /* Patterns co-occur - they validate each other */
+                learn_pattern_association(g, p1, p2);
+                /* Strengthen both patterns (mutual validation) */
+                pat1->strength = fmin(1.0f, pat1->strength + 0.005f * g->state.learning_rate);
+                pat2->strength = fmin(1.0f, pat2->strength + 0.005f * g->state.learning_rate);
+            }
+        }
+    }
+    
+    /* 5. Self-consistency checking: Patterns validate their own predictions */
+    /* If pattern predicts X and X appears in data, pattern validates itself */
+    for (uint32_t p = 0; p < g->pattern_count; p++) {
+        Pattern *pat = &g->patterns[p];
+        if (pat->activation < pat->threshold) continue;
+        
+        /* Check if pattern's predictions appear in input/output */
+        for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
+            uint32_t predicted_node = pat->predicted_nodes[pred];
+            bool prediction_validated = false;
+            
+            /* Check if predicted node appears in input */
+            for (uint32_t i = 0; i < g->input_length; i++) {
+                if (g->input_buffer[i] == predicted_node) {
+                    prediction_validated = true;
+                    break;
+                }
+            }
+            
+            /* Check if predicted node appears in output */
+            if (!prediction_validated) {
+                for (uint32_t i = 0; i < g->output_length; i++) {
+                    if (g->output_buffer[i] == predicted_node) {
+                        prediction_validated = true;
+                        break;
+                    }
+                }
+            }
+            
+            if (prediction_validated) {
+                /* Pattern's prediction validated by data - strengthen */
+                pat->prediction_successes++;
+                pat->prediction_weights[pred] = fmin(1.0f, pat->prediction_weights[pred] + 0.01f * g->state.learning_rate);
+            } else {
+                /* Prediction not validated - weaken slightly */
+                pat->prediction_weights[pred] = fmax(0.1f, pat->prediction_weights[pred] - 0.001f * g->state.learning_rate);
+            }
+            
+            pat->prediction_attempts++;
+        }
+    }
+    
+    /* 6. Pattern detection from data structure (always on, not just supervised) */
+    /* Detect patterns in input/output sequences - data structure provides patterns */
+    if (g->input_length > 1 || g->output_length > 1) {
+        detect_patterns(g);  /* Learn patterns from data structure */
+    }
+    
+    /* 7. Learn propagation and selection parameters from data */
+    /* Patterns learn HOW to propagate and HOW to select from what works */
+    learn_propagation_selection_parameters(g, target, target_len);
+}
+
+/* ============================================================================
+ * LEARN PROPAGATION & SELECTION PARAMETERS FROM DATA
+ * 
+ * Patterns learn HOW to propagate and HOW to select by tracking what works
+ * Like transistors - complexity comes from learned activation patterns
+ * ============================================================================ */
+
+void learn_propagation_selection_parameters(MelvinGraph *g, const uint8_t *target, uint32_t target_len) {
+    /* For each active pattern, learn if its propagation/selection led to success */
+    for (uint32_t p = 0; p < g->pattern_count; p++) {
+        Pattern *pat = &g->patterns[p];
+        if (pat->activation < pat->threshold) continue;
+        
+        /* Check if pattern's predictions matched what actually happened */
+        bool pattern_contributed_to_success = false;
+        
+        if (target != NULL && target_len > 0) {
+            /* Supervised: Check if pattern predicted target */
+            for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
+                uint32_t predicted_node = pat->predicted_nodes[pred];
+                for (uint32_t i = 0; i < target_len; i++) {
+                    if (target[i] == predicted_node) {
+                        pattern_contributed_to_success = true;
+                        break;
+                    }
+                }
+                if (pattern_contributed_to_success) break;
+            }
+        } else {
+            /* Self-supervised: Check if pattern's predictions appeared in output */
+            for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
+                uint32_t predicted_node = pat->predicted_nodes[pred];
+                for (uint32_t i = 0; i < g->output_length; i++) {
+                    if (g->output_buffer[i] == predicted_node) {
+                        pattern_contributed_to_success = true;
+                        break;
+                    }
+                }
+                if (pattern_contributed_to_success) break;
+            }
+        }
+        
+        /* Update propagation parameters based on success */
+        pat->propagation_attempts++;
+        if (pattern_contributed_to_success) {
+            pat->propagation_successes++;
+            
+            /* Success: Increase transfer rate (transfer more activation) */
+            pat->propagation_transfer_rate = fmin(1.0f, 
+                pat->propagation_transfer_rate + 0.01f * g->state.learning_rate);
+            
+            /* Success: Adjust decay rate toward optimal (keep more activation) */
+            pat->propagation_decay_rate = fmin(0.99f, 
+                pat->propagation_decay_rate + 0.005f * g->state.learning_rate);
+            
+            /* Success: Lower threshold (propagate more easily) */
+            pat->propagation_threshold = fmax(0.01f, 
+                pat->propagation_threshold - 0.001f * g->state.learning_rate);
+            
+            /* Success: Increase boost factor (patterns that work get stronger) */
+            pat->propagation_boost_factor = fmin(2.0f, 
+                pat->propagation_boost_factor + 0.01f * g->state.learning_rate);
+        } else {
+            /* Failure: Decrease transfer rate (transfer less) */
+            pat->propagation_transfer_rate = fmax(0.1f, 
+                pat->propagation_transfer_rate - 0.005f * g->state.learning_rate);
+            
+            /* Failure: Increase decay rate (lose activation faster) */
+            pat->propagation_decay_rate = fmax(0.5f, 
+                pat->propagation_decay_rate - 0.005f * g->state.learning_rate);
+            
+            /* Failure: Raise threshold (propagate less easily) */
+            pat->propagation_threshold = fmin(0.5f, 
+                pat->propagation_threshold + 0.001f * g->state.learning_rate);
+        }
+        
+        /* Update selection parameters based on success */
+        pat->selection_attempts++;
+        if (pattern_contributed_to_success) {
+            pat->selection_successes++;
+            
+            /* Success: Patterns that work increase their selection influence */
+            float success_rate = (float)pat->selection_successes / (float)pat->selection_attempts;
+            
+            /* If pattern is successful, increase factors that matter */
+            if (success_rate > 0.6f) {
+                /* High success: Increase pattern factor (patterns matter more) */
+                pat->selection_pattern_factor = fmin(0.5f, 
+                    pat->selection_pattern_factor + 0.01f * g->state.learning_rate);
+                
+                /* High success: Increase context factor (context matters) */
+                pat->selection_context_factor = fmin(0.4f, 
+                    pat->selection_context_factor + 0.01f * g->state.learning_rate);
+            } else {
+                /* Moderate success: Increase weight factor (edges matter) */
+                pat->selection_weight_factor = fmin(0.6f, 
+                    pat->selection_weight_factor + 0.01f * g->state.learning_rate);
+                
+                /* Moderate success: Increase activation factor */
+                pat->selection_activation_factor = fmin(0.5f, 
+                    pat->selection_activation_factor + 0.01f * g->state.learning_rate);
+            }
+        } else {
+            /* Failure: Decrease pattern factor (patterns don't help) */
+            pat->selection_pattern_factor = fmax(0.05f, 
+                pat->selection_pattern_factor - 0.005f * g->state.learning_rate);
+            
+            /* Failure: Increase weight factor (fall back to edges) */
+            pat->selection_weight_factor = fmin(0.7f, 
+                pat->selection_weight_factor + 0.005f * g->state.learning_rate);
         }
     }
 }
