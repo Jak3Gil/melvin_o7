@@ -64,6 +64,9 @@ typedef struct {
     uint64_t fire_count;       /* Times this node fired */
     uint64_t receive_count;    /* Times this node received input */
     
+    /* NATURAL CONTEXT: What activated this node? */
+    uint32_t activated_by;     /* Node ID that caused this activation (BYTE_VALUES = input) */
+
 } Node;
 
 /* ============================================================================
@@ -75,19 +78,24 @@ typedef struct {
 
 typedef struct {
     uint32_t to_id;            /* Target node or pattern ID */
-    
+
     /* Weight is RELATIVE STRENGTH of this edge FROM this source node */
     /* NOT a global proportion - relative to other edges from same source */
     /* Grows with usage and success - no global normalization */
     float weight;              /* Absolute strength - relative to source node's other edges */
-    
+
     /* Usage tracking (for computing relative importance) */
     uint64_t use_count;        /* Times this edge was traversed */
     uint64_t success_count;    /* Times traversal led to correct output */
-    
+
     bool active;               /* Is this edge currently in use? */
     bool is_pattern_edge;      /* If true, to_id refers to pattern, not node */
     
+    /* NATURAL CONTEXT: When is this edge valid? */
+    /* Learned from training - edge strengthened when source activated by this node */
+    uint32_t context_node;     /* Node that typically precedes source when this edge fires */
+                               /* BYTE_VALUES = input context, < BYTE_VALUES = specific predecessor */
+
 } Edge;
 
 /* ============================================================================
@@ -870,6 +878,11 @@ float compute_firing_probability(MelvinGraph *g, uint32_t node_id) {
  * ============================================================================ */
 
 void create_or_strengthen_edge(MelvinGraph *g, uint32_t from_id, uint32_t to_id) {
+    /* DEBUG: Track 'a'→'t' shortcut creation */
+    if (from_id == 'a' && to_id == 't') {
+        fprintf(stderr, "EDGE CREATE: 'a'→'t' being created/strengthened\n");
+    }
+    
     /* CRITICAL FIX: Prevent self-loops (root cause of chaotic outputs) */
     if (from_id == to_id) {
         return;  /* Never create edge from node to itself */
@@ -880,26 +893,10 @@ void create_or_strengthen_edge(MelvinGraph *g, uint32_t from_id, uint32_t to_id)
         return;  /* Can't create edge FROM invalid node */
     }
     
-    /* DEBUG */
-    if (to_id == END_MARKER) {
-        fprintf(stderr, "DEBUG: Creating END_MARKER edge from %u\n", from_id);
-    }
-    
-    /* UNIDIRECTIONAL ENFORCEMENT: Prevent creating reverse edge if forward exists */
-    /* Check if reverse edge (to→from) already exists - only for byte nodes */
-    if (to_id < BYTE_VALUES) {
-        EdgeList *reverse_check = &g->outgoing[to_id];
-        for (uint32_t i = 0; i < reverse_check->count; i++) {
-            if (reverse_check->edges[i].to_id == from_id && reverse_check->edges[i].active) {
-                /* Reverse edge exists! This would create bidirectional pair */
-                /* STRICT RULE: Never allow bidirectional edges */
-                /* Strengthen the existing reverse edge instead */
-                reverse_check->edges[i].use_count++;
-                return;  /* Don't create forward edge - keep unidirectional */
-            }
-        }
-    }
-    /* Note: END_MARKER (257) doesn't have outgoing edges, skip reverse check */
+    /* BIDIRECTIONAL EDGES ALLOWED: Context determines meaning */
+    /* Same nodes in different contexts can have different relationships */
+    /* Loop prevention happens via loop_pressure during generation, not here */
+    /* Example: 'a'→'c' (input→output) AND 'c'→'a' (sequence) are both valid */
     
     /* PORT-AWARE EDGE CREATION: Only create edges within same port */
     /* Cross-port edges are weaker (prevents modality confusion) */
@@ -922,6 +919,22 @@ void create_or_strengthen_edge(MelvinGraph *g, uint32_t from_id, uint32_t to_id)
              */
             float old_weight = out->edges[i].weight;
             out->edges[i].use_count++;
+            
+            /* NATURAL CONTEXT: Remember what activated the source when this edge was used */
+            uint32_t current_context = g->nodes[from_id].activated_by;
+            
+            /* DEBUG: Log context setting for key edges */
+            if (from_id == 'a' && (to_id == 'c' || to_id == 't')) {
+                fprintf(stderr, "EDGE_CTX: '%c'->'%c' current_ctx=%u, edge_ctx=%u\n",
+                       (char)from_id, (char)to_id, current_context, out->edges[i].context_node);
+            }
+            
+            /* Set context: Keep first learned context (don't overwrite) */
+            /* This preserves the original context where edge was created */
+            if (out->edges[i].context_node == 0) {
+                out->edges[i].context_node = current_context;  /* Initial context */
+            }
+            /* Otherwise keep original context - edges remember their origin */
             
             /* Base growth rate */
             float base_growth = 0.1f * g->state.learning_rate * port_penalty;
@@ -983,6 +996,7 @@ void create_or_strengthen_edge(MelvinGraph *g, uint32_t from_id, uint32_t to_id)
     e->success_count = 0;
     e->active = true;
     e->is_pattern_edge = false;  /* This is a node edge, not pattern edge */
+    e->context_node = g->nodes[from_id].activated_by;  /* Remember creation context */
     
     out->count++;
     
@@ -2506,6 +2520,12 @@ void propagate_activation(MelvinGraph *g) {
     propagate_pattern_activation(g);
     
     /* PHASE 2: EDGE-BASED PROPAGATION (Follow learned edges) */
+    /* Save initial activations before propagation (for selective decay) */
+    float initial_activations[BYTE_VALUES];
+    for (int i = 0; i < BYTE_VALUES; i++) {
+        initial_activations[i] = g->nodes[i].activation;
+    }
+    
     /* For each active node, spread activation to neighbors via learned edges */
     for (int i = 0; i < BYTE_VALUES; i++) {
         if (!g->nodes[i].exists) continue;
@@ -2636,221 +2656,97 @@ void propagate_activation(MelvinGraph *g) {
                 }
             }
             
-            /* Information = edge strength from input × pattern support × sequential flow */
-            /* All factors now [0, ~2], naturally normalized, no division needed */
-            float information = input_connection * context_match * history_coherence;
-            /* Early exploration: if all factors are weak, use edge existence as baseline */
-            if (information < 0.01f) {
-                /* Allow some information flow based on any connection */
-                information = input_connection + context_match + history_coherence;
-                if (information < 0.01f) {
-                    /* Absolute baseline: edge exists = some information */
-                    information = 0.1f;  /* Minimum for exploration */
-                }
-            }
-            
             /* ========================================================================
-             * FACTOR 2: Learning_Strength (EDGE WEIGHT × SUCCESS RATE × USAGE)
-             * How well-learned is this path? Use actual training results
+             * SIMPLIFIED DYNAMIC PATH QUALITY
+             * 
+             * Intelligence = activation flow, not static coefficients
+             * Use LIVE activation values - they ARE the dynamic state
              * ======================================================================== */
-            float edge_weight = edge->weight;  /* Learned strength [0,1] */
-            float usage_boost = logf(1.0f + edge->use_count) / 5.0f;  /* Log scale usage */
-            float success_rate = (edge->use_count > 0) ? 
-                ((float)edge->success_count / (float)edge->use_count) : 0.0f;  /* Training success */
             
-            /* Learning = base weight × success rate × usage */
-            /* Trained paths (high success_rate) get HUGE boost */
-            float learning = edge_weight * (1.0f + success_rate * 10.0f) * (1.0f + usage_boost);
-            /* Range: [0.1, ~20] for well-trained paths, ~0.1 for untrained */
-            /* Success rate × 10 means 100% success = 11x boost! */
+            /* 1. EDGE WEIGHT: Memory of past success (static but earned) */
+            float edge_strength = edge->weight;
             
-            /* ========================================================================
-             * FACTOR 3: Coherence (PATTERN ALIGNMENT × SEQUENTIAL FLOW)
-             * Does this path form a coherent sequence? Use pattern support
-             * ======================================================================== */
-            /* Pattern alignment = strongest pattern supporting this target */
-            float pattern_alignment = context_match;  /* Already computed as pattern support */
+            /* 2. SOURCE ACTIVATION: Current relevance (dynamic) */
+            float source_relevance = g->nodes[i].activation;
             
-            /* Sequential flow = history coherence */
-            float sequential_flow = history_coherence;  /* Already computed as edge weight */
-            
-            /* Context fit = pattern support */
-            float context_fit = context_match;  /* Pattern strength × activation */
-            
-            /* Coherence = pattern support × sequential flow */
-            float coherence = (pattern_alignment + sequential_flow + context_fit) / 3.0f;
-            /* Range: [0, ~2] for paths matching patterns and history */
-            
-            /* ========================================================================
-             * FACTOR 4: Predictive_Power
-             * How well does this path predict correct outputs?
-             * ======================================================================== */
-            /* ========================================================================
-             * INTELLIGENT ACTIVATION: Pattern hierarchy and meaning guide flow (RELATIVE)
-             * ======================================================================== */
-            float pattern_prediction = avg_pattern_prediction;  /* Default: relative to system average */
-            float pattern_meaning_boost = 1.0f;  /* Start neutral, boost relative to system */
-            float hierarchy_boost = 1.0f;  /* Start neutral, boost relative to system */
-            
-            /* Check if this edge is part of an active pattern */
-            for (uint32_t p = 0; p < g->pattern_count; p++) {
+            /* 3. PATTERN ACTIVATION: Live pattern support (dynamic) */
+            /* Patterns that contain this edge and are currently active boost flow */
+            float pattern_flow = 0.0f;
+            for (uint32_t p = 0; p < g->pattern_count && p < 500; p++) {
                 Pattern *pat = &g->patterns[p];
-                if (pat->activation > pat->threshold && pat->activation > 0.1f) {
-                    /* Pattern is active - check if it predicts this target */
-                    for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
-                        if (pat->predicted_nodes[pred] == target) {
-                            /* Pattern confidence = activation × strength (relative to system) */
-                            float raw_prediction = pat->activation * pat->strength;
-                            pattern_prediction = (avg_pattern_prediction > 0.0f) ? 
-                                (raw_prediction / avg_pattern_prediction) : raw_prediction;
-                            
-                            /* INTELLIGENT ACTIVATION: Meaning boost (RELATIVE to system average) */
-                            /* Patterns with accumulated meaning carry more information */
-                            /* FIX: Use bounded meaning to prevent overflow in ratio */
-                            float bounded_meaning = pat->accumulated_meaning;
-                            if (bounded_meaning > 1000.0f) bounded_meaning = 1000.0f;
-                            if (bounded_meaning != bounded_meaning || bounded_meaning > 1e6f) {
-                                bounded_meaning = 1.0f;  /* Reset if NaN/Inf */
-                            }
-                            float meaning_ratio = (avg_pattern_meaning > 0.01f) ? 
-                                (bounded_meaning / avg_pattern_meaning) : 1.0f;
-                            if (meaning_ratio > 100.0f) meaning_ratio = 100.0f;  /* Cap ratio */
-                            pattern_meaning_boost = 1.0f + meaning_ratio;  /* Relative boost */
-                            if (pattern_meaning_boost > 200.0f) pattern_meaning_boost = 200.0f;  /* Cap boost */
-                            
-                            /* INTELLIGENT ACTIVATION: Hierarchy depth (RELATIVE - use pattern depth relative to max) */
-                            /* Deeper patterns (more abstract) = more meaningful */
-                            float max_chain_depth = 10.0f;  /* Reasonable max (could be computed from system) */
-                            float relative_depth = (pat->chain_depth / max_chain_depth);
-                            hierarchy_boost = 1.0f + relative_depth;  /* Relative boost */
-                            
-                            break;
-                        }
+                if (pat->activation < 0.01f) continue;  /* Skip inactive patterns */
+                
+                /* Check if edge is in this pattern */
+                for (uint32_t idx = 0; idx + 1 < pat->length; idx++) {
+                    if (pat->node_ids[idx] == (uint32_t)i && pat->node_ids[idx + 1] == target) {
+                        /* Pattern's ACTIVATION is its current influence - not a multiplier */
+                        pattern_flow += pat->activation;
+                        
+                        /* FEEDBACK: Edge being considered boosts pattern slightly */
+                        /* This is the circular part - using the edge reinforces the pattern */
+                        pat->activation += 0.01f * source_relevance;
+                        break;
                     }
-                    
-                    /* Check if this edge (i → target) is part of the pattern sequence */
-                    /* If pattern contains this edge sequence, boost activation flow */
-                    for (uint32_t pat_idx = 0; pat_idx < pat->length - 1; pat_idx++) {
-                        if (pat->node_ids[pat_idx] == i && 
-                            pat->node_ids[pat_idx + 1] == target) {
-                            /* This edge is part of an active pattern! */
-                            /* INTELLIGENT ACTIVATION: Rich pattern connections boost flow */
-                            float pattern_edge_boost = pat->activation * pat->strength * 
-                                                      pat->dynamic_importance * 
-                                                      pattern_meaning_boost * hierarchy_boost;
-                            pattern_prediction = fmax(pattern_prediction, pattern_edge_boost);
+                }
+            }
+            
+            /* 4. CONTEXT: Is source connected to current flow? (dynamic) */
+            float context_support = 0.0f;
+            
+            /* Check if source is input */
+            bool is_from_input = false;
+            for (uint32_t in = 0; in < g->input_length; in++) {
+                if (g->input_buffer[in] == (uint32_t)i) {
+                    is_from_input = true;
+                    context_support = 1.0f;  /* Direct from input = strong context */
+                    break;
+                }
+            }
+            
+            /* Check if source follows from last output */
+            if (!is_from_input && g->output_length > 0) {
+                uint32_t last_out = g->output_buffer[g->output_length - 1];
+                if ((uint32_t)i == last_out) {
+                    context_support = 1.0f;  /* Continuing from last output */
+                } else {
+                    /* Check if there's an edge from last_out to source */
+                    EdgeList *last_edges = &g->outgoing[last_out];
+                    for (uint32_t e = 0; e < last_edges->count; e++) {
+                        if (last_edges->edges[e].active && last_edges->edges[e].to_id == (uint32_t)i) {
+                            context_support = last_edges->edges[e].weight * 0.5f;
                             break;
                         }
                     }
                 }
             }
             
-            /* Edge's historical success rate (training signal) */
-            float historical_accuracy = success_rate;  /* [0,1] from edge success */
-            float context_prediction = context_match;  /* Pattern support */
+            /* No context = weak (but not zero - allow exploration) */
+            if (context_support < 0.1f) context_support = 0.1f;
             
-            /* INTELLIGENT ACTIVATION: Pattern predictions × training success */
-            /* Predictive = how well this path predicts correct outputs */
-            float predictive = pattern_prediction * pattern_meaning_boost * hierarchy_boost * 
-                             (0.5f + historical_accuracy * 0.5f) * context_prediction;
-            /* Range: [0, ~4] for well-predicted paths */
+            /* 5. PATH QUALITY: All dynamic values flow together */
+            /* edge_strength = memory (what worked before) */
+            /* source_relevance = current state (what's active now) */
+            /* pattern_flow = pattern support (active patterns containing this edge) */
+            /* context_support = flow coherence (does this follow naturally) */
             
-            /* ========================================================================
-             * SELF-REGULATED PATH QUALITY: Importance determines quality
-             * 
-             * Path quality reflects MEANING/IMPORTANCE (learned by system)
-             * Not fixed formulas - the system decides what's important
-             * 
-             * Important paths (high usage, high success, high activation) = high quality
-             * Unimportant paths = low quality
-             * 
-             * The system self-regulates: learns what's important through experience
-             * ======================================================================== */
+            float path_quality = edge_strength * context_support;
             
-            /* ========================================================================
-             * PATH QUALITY = Learning + Bonuses
-             * 
-             * Core principle: Edge weight (learning) is BASE quality
-             * Other factors are BONUSES that enhance it
-             * 
-             * This ensures:
-             * - Even untrained edges have some quality (exploration)
-             * - Trained edges get major boosts (exploitation)
-             * - Information/patterns enhance, not replace
-             * ======================================================================== */
-            
-            /* BASE: Edge weight is the foundation (always > 0 for active edges) */
-            float base_quality = learning;  /* [0, ~6] for trained, ~0.1 for new */
-            
-            /* BONUS 1: Information boost (relevant to input) */
-            if (information > 0.1f) {
-                base_quality *= (1.0f + information * 0.5f);  /* Up to 2x boost */
+            /* Pattern flow ADDS to quality (patterns are additional support, not gates) */
+            if (pattern_flow > 0.0f) {
+                path_quality += pattern_flow;
             }
             
-            /* BONUS 2: Pattern prediction boost */
-            if (predictive > 0.1f) {
-                base_quality *= (1.0f + predictive * 0.3f);  /* Up to 2.2x boost */
+            /* History coherence: recent outputs predict this? */
+            if (history_coherence > 0.1f) {
+                path_quality *= (1.0f + history_coherence);
             }
             
-            /* BONUS 3: Coherence boost */
-            if (coherence > 0.1f) {
-                base_quality *= (1.0f + coherence * 0.2f);  /* Up to 1.4x boost */
-            }
-            
-            /* Result: Untrained edges ~0.1, trained edges 0.1 → 6.0 → 18.0 with all bonuses */
-            
-            /* INTELLIGENT ACTIVATION: Rich pattern connections boost path quality (RELATIVE) */
-            /* If this edge is part of active patterns with meaning, boost quality */
-            float pattern_connection_boost = 1.0f;
-            for (uint32_t p = 0; p < g->pattern_count; p++) {
-                Pattern *pat = &g->patterns[p];
-                if (pat->activation > pat->threshold && pat->activation > 0.1f) {
-                    /* Check if edge is in pattern sequence */
-                    for (uint32_t pat_idx = 0; pat_idx < pat->length - 1; pat_idx++) {
-                        if (pat->node_ids[pat_idx] == i && 
-                            pat->node_ids[pat_idx + 1] == target) {
-                            /* Edge is part of active pattern - boost based on pattern's meaning (relative) */
-                            /* Meaning boost: relative to system average */
-                            /* FIX: Use bounded meaning to prevent overflow */
-                            float bounded_meaning = pat->accumulated_meaning;
-                            if (bounded_meaning > 1000.0f) bounded_meaning = 1000.0f;
-                            if (bounded_meaning != bounded_meaning || bounded_meaning > 1e6f) {
-                                bounded_meaning = 1.0f;  /* Reset if NaN/Inf */
-                            }
-                            float meaning_ratio = (avg_pattern_meaning > 0.01f) ? 
-                                (bounded_meaning / avg_pattern_meaning) : 1.0f;
-                            if (meaning_ratio > 100.0f) meaning_ratio = 100.0f;  /* Cap ratio */
-                            /* Dynamic importance is already relative (0.0 to 1.0 range) */
-                            float pattern_boost = 1.0f + meaning_ratio + pat->dynamic_importance;
-                            if (pattern_boost > 200.0f) pattern_boost = 200.0f;  /* Cap boost */
-                            pattern_connection_boost = fmax(pattern_connection_boost, pattern_boost);
-                            break;
-                        }
-                    }
-                }
-            }
-            
-            /* SELF-TUNING: Adjust path quality based on error rate and pattern support */
-            /* High error = reduce quality, low error = keep quality */
-            float quality_adjustment = 1.0f - (g->state.error_rate * 0.5f);
-            
-            /* Final path quality: base × pattern boost × error adjustment */
-            path_qualities[j] = base_quality * pattern_connection_boost * quality_adjustment;
+            path_qualities[j] = path_quality;
             
             /* Ensure minimum quality for exploration (prevent zero-sum) */
             if (path_qualities[j] < 0.001f) path_qualities[j] = 0.001f;
             
-            // #region agent log
-            if (j < 5) {  // Log first 5 edges only
-                FILE *f = fopen("f:\\Melvin_Research\\Melvin_o7\\melvin_o7\\.cursor\\debug.log", "a");
-                if (f) {
-                    fprintf(f, "{\"location\":\"melvin.c:2450\",\"message\":\"path quality calculated\",\"data\":{\"from\":%d,\"to\":%u,\"learning\":%.3f,\"info\":%.3f,\"quality\":%.3f,\"edge_weight\":%.3f,\"success_rate\":%.3f},\"timestamp\":%lld,\"sessionId\":\"debug-session\",\"hypothesisId\":\"C\"}\n",
-                            i, target, learning, information, path_qualities[j], edge_weight, success_rate,
-                            (long long)time(NULL) * 1000);
-                    fclose(f);
-                }
-            }
-            // #endregion
+            /* Debug logging removed - simplified path quality */
             total_path_quality += path_qualities[j];
         }
         
@@ -2911,13 +2807,27 @@ void propagate_activation(MelvinGraph *g) {
             /* "your girlfriend cheated on you" SHOULD have high activation - it's important! */
             g->nodes[target].activation += transfer;
             
+            /* Track what activated this node (natural context) */
+            if (transfer > 0.01f) {
+                g->nodes[target].activated_by = i;  /* This source activated target */
+            }
+
+            /* DEBUG: Log activation transfer for key edges during first generation step */
+            if ((i == 'a' && (target == 'c' || target == 't')) && g->output_length == 0) {
+                fprintf(stderr, "WAVE_PROP: '%c'->%c': src_act=%.3f, path_qual=%.3f, norm_qual=%.3f, learned_rate=%.3f, transfer=%.3f → tgt_act=%.3f\n",
+                       (char)i, (char)target, g->nodes[i].activation, path_qualities[j], normalized_quality,
+                       learned_transfer_rate, transfer, g->nodes[target].activation);
+            }
+            
             /* SELF-REGULATION: Cap node activation to prevent unbounded growth */
             /* But allow high activation for important things (up to reasonable limit) */
             if (g->nodes[target].activation > 100.0f) {
                 g->nodes[target].activation = 100.0f;  /* Cap to prevent explosion */
             }
             g->nodes[target].receive_count++;
-            out->edges[j].use_count++;
+            /* DON'T increment use_count here - only feedback should track successful use */
+            /* Wave prop happens every step, but doesn't mean the edge was correct */
+            /* out->edges[j].use_count++; */  /* REMOVED: causes wrong edges to strengthen */
             
             /* CREATE EDGE IF ACTIVATION TRANSFER IS STRONG (wave propagation creates connections) */
             /* If activation successfully transferred, strengthen the connection */
@@ -2932,26 +2842,18 @@ void propagate_activation(MelvinGraph *g) {
             }
         }
         
-        /* Source node activation decays after propagating (like signal attenuation) */
-        /* DATA-DRIVEN DECAY: Use pattern-learned decay rate */
-        float learned_decay_rate = 0.9f;  /* Default decay */
+        /* TEMPORAL DECAY: Only decay activation that existed BEFORE propagation */
+        /* Newly received activation should be preserved for immediate use */
+        float initial_act = initial_activations[i];
+        float received_act = g->nodes[i].activation - initial_act;
+        if (received_act < 0.0f) received_act = 0.0f;  /* Sanity check */
         
-        /* Find pattern that best matches this node's context */
-        for (uint32_t p = 0; p < g->pattern_count; p++) {
-            Pattern *pat = &g->patterns[p];
-            if (pat->activation > pat->threshold) {
-                /* Check if pattern contains this node */
-                for (uint32_t pat_idx = 0; pat_idx < pat->length; pat_idx++) {
-                    if (pat->node_ids[pat_idx] == i) {
-                        /* Use this pattern's learned decay rate */
-                        learned_decay_rate = pat->propagation_decay_rate;
-                        break;
-                    }
-                }
-            }
-        }
+        /* Decay old activation (from before this step) */
+        float decay_rate = 0.3f;  /* Strong decay for temporal locality */
+        initial_act *= decay_rate;
         
-        g->nodes[i].activation *= learned_decay_rate;  /* Pattern-learned decay */
+        /* New activation = decayed_old + fresh_received */
+        g->nodes[i].activation = initial_act + received_act;
         g->nodes[i].fire_count++;
     }
     
@@ -3484,7 +3386,8 @@ void inject_input_from_port(MelvinGraph *g, const uint8_t *bytes, uint32_t lengt
         
         /* Add activation (purely local) */
         g->nodes[byte].activation += injection_strength;
-        
+        g->nodes[byte].activated_by = BYTE_VALUES;  /* Special: activated by INPUT */
+
         /* Create sequential edges (Hebbian: this byte followed that byte) */
         if (i > 0) {
             uint8_t prev_byte = bytes[i - 1];
@@ -3952,14 +3855,16 @@ uint32_t select_output_node(MelvinGraph *g) {
      * ======================================================================== */
     float end_marker_score = 0.0f;
     
-    /* TEMPORARILY DISABLED FOR DEBUGGING
+    /* END_MARKER gets activation from patterns that predict it */
     for (uint32_t p = 0; p < g->pattern_count; p++) {
         Pattern *pat = &g->patterns[p];
         if (pat->activation <= pat->threshold) continue;
         
+        /* Check if pattern predicts END_MARKER */
         for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
             if (pat->predicted_nodes[pred] == END_MARKER) {
                 float contribution = pat->activation * pat->prediction_weights[pred] * pat->strength;
+                /* Meaning boost for END prediction too */
                 if (pat->accumulated_meaning > 0.1f) {
                     contribution *= (1.0f + pat->accumulated_meaning * 0.1f);
                 }
@@ -3968,6 +3873,7 @@ uint32_t select_output_node(MelvinGraph *g) {
         }
     }
     
+    /* END_MARKER also gets activation from edges predicting it (last char → END) */
     if (g->output_length > 0) {
         uint32_t last_output = g->output_buffer[g->output_length - 1];
         if (last_output < BYTE_VALUES) {
@@ -3979,7 +3885,6 @@ uint32_t select_output_node(MelvinGraph *g) {
             }
         }
     }
-    */
     
     /* STEP 1: Check pattern predictions (pattern-guided intelligence) */
     /* Patterns find meaning from highest level (deeper hierarchy = more meaning) */
@@ -4343,36 +4248,59 @@ uint32_t select_output_node(MelvinGraph *g) {
         }
     }
     
-    /* STEP 4: Final fallback: Use context-aware selection */
-    /* CRITICAL FIX: When output is empty, use INPUT context, not just highest activation */
+    /* STEP 4: Final fallback: Use highest activation from wave propagation */
+    /* Wave propagation already spread activation along learned edges */
+    /* IMPORTANT: Prefer nodes reached via edges over input nodes */
+    /* Input is context (what we're given), output is prediction (what we generate) */
     if (selected_node >= BYTE_VALUES) {
-        if (g->output_length == 0 && g->input_length > 0) {
-            /* FIRST SELECTION: Use INPUT context - select first character of input */
-            /* Different inputs should produce different first outputs */
-            selected_node = g->input_buffer[0];
-            if (selected_node >= BYTE_VALUES || !g->nodes[selected_node].exists) {
-                /* Fallback: find node with highest activation that's in input */
-                float max_activation = 0.0f;
-                for (uint32_t i = 0; i < g->input_length; i++) {
-                    uint32_t input_node = g->input_buffer[i];
-                    if (input_node < BYTE_VALUES && g->nodes[input_node].exists) {
-                        if (g->nodes[input_node].activation > max_activation) {
-                            max_activation = g->nodes[input_node].activation;
-                            selected_node = input_node;
+        /* Select node with highest activation (from wave propagation) */
+        float max_activation = 0.0f;
+        for (int i = 0; i < BYTE_VALUES; i++) {
+            if (!g->nodes[i].exists) continue;
+            
+            /* Check if this is an input node (should be deprioritized) */
+            bool is_input = false;
+            for (uint32_t in = 0; in < g->input_length; in++) {
+                if (g->input_buffer[in] == (uint32_t)i) {
+                    is_input = true;
+                    break;
+                }
+            }
+            
+            /* Deprioritize input nodes: they are CONTEXT, not OUTPUT */
+            float node_activation = g->nodes[i].activation;
+            if (is_input) {
+                node_activation *= 0.3f;  /* 70% penalty for echoing input */
+            }
+            
+            /* BOOST nodes directly connected FROM input (first hop) */
+            /* These should be favored for first output - they're the direct response */
+            if (g->output_length == 0) {
+                for (uint32_t in = 0; in < g->input_length; in++) {
+                    uint32_t input_node = g->input_buffer[in];
+                    EdgeList *out_edges = &g->outgoing[input_node];
+                    for (uint32_t e = 0; e < out_edges->count; e++) {
+                        if (out_edges->edges[e].active && out_edges->edges[e].to_id == (uint32_t)i) {
+                            /* This node is directly connected from input */
+                            node_activation *= 2.0f;  /* Boost direct connections */
+                            break;
                         }
                     }
                 }
             }
-        } else {
-            /* CONTINUATION: Use highest activation from wave propagation */
-            float max_activation = 0.0f;
-            for (int i = 0; i < BYTE_VALUES; i++) {
-                if (g->nodes[i].exists && g->nodes[i].activation > max_activation) {
-                    max_activation = g->nodes[i].activation;
-                    selected_node = i;
-                }
+            
+            if (node_activation > max_activation) {
+                max_activation = node_activation;
+                selected_node = i;
+            }
+            
+            /* DEBUG: Log activation of key nodes */
+            if (g->output_length == 0 && (i == 'a' || i == 'c' || i == 't')) {
+                fprintf(stderr, "SELECT DEBUG: '%c' raw_act=%.3f, adj_act=%.3f, is_input=%d\n",
+                       (char)i, g->nodes[i].activation, node_activation, is_input);
             }
         }
+        fprintf(stderr, "SELECT DEBUG: Winner='%c' (act=%.3f)\n", (char)selected_node, max_activation);
     }
     
     /* TRACK CONTRIBUTION: Record which edge led to this selection */
@@ -4426,11 +4354,10 @@ uint32_t select_output_node(MelvinGraph *g) {
      * FINAL CHECK: Does END_MARKER (silence) beat the best byte node?
      * No threshold - pure competition. Silence wins when it has more activation.
      * ======================================================================== */
-    /* TEMPORARILY DISABLED FOR DEBUGGING
     if (end_marker_score > best_score && end_marker_score > 0.0f) {
+        /* Silence wins - system learned this is a good place to stop */
         return END_MARKER;
     }
-    */
     
     return selected_node;
     
@@ -5015,12 +4942,15 @@ void apply_feedback(MelvinGraph *g, const uint8_t *target, uint32_t target_lengt
             }
             // #endregion
             
-            for (uint32_t ec = 0; ec < contrib->edge_count; ec++) {
-                uint32_t from = contrib->edges[ec].from_node;
-                create_or_strengthen_edge(g, from, predicted);
+            /* POSITIONAL FEEDBACK: Only strengthen sequential edges, not long-range */
+            /* Don't strengthen edges from ANY active node - only from previous output */
+            /* This prevents shortcuts like 'a'→'t' when 'a' is far back in sequence */
+            if (i > 0) {
+                uint32_t prev_output = g->output_buffer[i - 1];
+                create_or_strengthen_edge(g, prev_output, predicted);
                 
-                /* CRITICAL: Increment success_count for correct predictions */
-                EdgeList *from_out = &g->outgoing[from];
+                /* Increment success_count for this sequential edge */
+                EdgeList *from_out = &g->outgoing[prev_output];
                 for (uint32_t e = 0; e < from_out->count; e++) {
                     if (from_out->edges[e].to_id == predicted && from_out->edges[e].active) {
                         from_out->edges[e].success_count++;
@@ -5028,7 +4958,7 @@ void apply_feedback(MelvinGraph *g, const uint8_t *target, uint32_t target_lengt
                         FILE *f2 = fopen("f:\\Melvin_Research\\Melvin_o7\\melvin_o7\\.cursor\\debug.log", "a");
                         if (f2) {
                             fprintf(f2, "{\"location\":\"melvin.c:3986\",\"message\":\"edge success incremented\",\"data\":{\"from\":%u,\"to\":%u,\"success\":%llu,\"use\":%llu,\"weight\":%.3f},\"timestamp\":%lld,\"sessionId\":\"debug-session\",\"runId\":\"debug3\",\"hypothesisId\":\"G\"}\n",
-                                    from, predicted, (unsigned long long)from_out->edges[e].success_count, 
+                                    prev_output, predicted, (unsigned long long)from_out->edges[e].success_count, 
                                     (unsigned long long)from_out->edges[e].use_count, from_out->edges[e].weight,
                                     (long long)time(NULL) * 1000);
                             fclose(f2);
@@ -5141,7 +5071,16 @@ void apply_feedback(MelvinGraph *g, const uint8_t *target, uint32_t target_lengt
     /* learning_rate = 0.5 * learning_pressure (already set in compute_system_state) */
     
     /* Strengthen sequential edges in target (correct path) */
+    /* CRITICAL: Set correct context for each edge BEFORE creating */
+    /* Edge target[i]→target[i+1] should have context = target[i-1] (what precedes source) */
     for (uint32_t i = 0; i < target_length - 1; i++) {
+        if (i == 0) {
+            /* First edge: source (target[0]) comes from input context */
+            g->nodes[target[i]].activated_by = BYTE_VALUES;
+        } else {
+            /* Later edges: source comes from previous target char */
+            g->nodes[target[i]].activated_by = target[i - 1];
+        }
         create_or_strengthen_edge(g, target[i], target[i + 1]);
     }
     
@@ -5151,11 +5090,57 @@ void apply_feedback(MelvinGraph *g, const uint8_t *target, uint32_t target_lengt
      * ======================================================================== */
     if (target_length > 0) {
         uint32_t last_target_char = target[target_length - 1];
-        fprintf(stderr, "DEBUG: About to create END_MARKER edge from %u\n", last_target_char);
-        fflush(stderr);
+        
+        /* Create edge: last_char → END_MARKER */
         create_or_strengthen_edge(g, last_target_char, END_MARKER);
-        fprintf(stderr, "DEBUG: END_MARKER edge created successfully\n");
-        fflush(stderr);
+        
+        /* Teach patterns that end at target end to predict END_MARKER */
+        for (uint32_t p = 0; p < g->pattern_count; p++) {
+            Pattern *pat = &g->patterns[p];
+            if (pat->length == 0 || pat->length > target_length) continue;
+            
+            /* Check if pattern matches at END of target */
+            uint32_t start_pos = target_length - pat->length;
+            bool matches_end = true;
+            for (uint32_t i = 0; i < pat->length; i++) {
+                if (!MATCHES_BLANK(target[start_pos + i], pat->node_ids[i])) {
+                    matches_end = false;
+                    break;
+                }
+            }
+            
+            if (matches_end) {
+                /* Pattern matches end of target - teach it to predict END_MARKER */
+                bool has_end_prediction = false;
+                for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
+                    if (pat->predicted_nodes[pred] == END_MARKER) {
+                        /* Strengthen existing END prediction */
+                        pat->prediction_weights[pred] += g->state.learning_rate * 0.3f;
+                        if (pat->prediction_weights[pred] > 1.0f) {
+                            pat->prediction_weights[pred] = 1.0f;
+                        }
+                        has_end_prediction = true;
+                        break;
+                    }
+                }
+                
+                /* Add END_MARKER prediction if not present */
+                if (!has_end_prediction) {
+                    if (pat->prediction_count == 0) {
+                        pat->predicted_nodes = malloc(sizeof(uint32_t) * 4);
+                        pat->prediction_weights = malloc(sizeof(float) * 4);
+                    } else if (pat->prediction_count % 4 == 0) {
+                        pat->predicted_nodes = realloc(pat->predicted_nodes,
+                                                       sizeof(uint32_t) * (pat->prediction_count + 4));
+                        pat->prediction_weights = realloc(pat->prediction_weights,
+                                                         sizeof(float) * (pat->prediction_count + 4));
+                    }
+                    pat->predicted_nodes[pat->prediction_count] = END_MARKER;
+                    pat->prediction_weights[pat->prediction_count] = g->state.learning_rate * 0.2f;
+                    pat->prediction_count++;
+                }
+            }
+        }
     }
     
     /* Pattern backpropagation (preserves neural net learning) */
@@ -5234,13 +5219,24 @@ void pattern_backprop(MelvinGraph *g, uint32_t pattern_id, float error, const ui
 
 void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
                  const uint8_t *target, uint32_t target_len) {
-    
+
+    fprintf(stderr, "DEBUG: run_episode START, input_len=%u, target_len=%u\n", input_len, target_len);
+    fflush(stderr);
+
     /* CRITICAL: Clear input buffer at start of each episode */
     /* Otherwise input accumulates: "cat" + "dog" = "catdog" */
     g->input_length = 0;
-    
+
     /* Reset output and contribution tracking */
     g->output_length = 0;
+    
+    /* CRITICAL: Reset node activations between episodes */
+    /* Each episode starts fresh - structure (edges/patterns) persists, activation doesn't */
+    /* This prevents cross-episode contamination */
+    for (int n = 0; n < BYTE_VALUES; n++) {
+        g->nodes[n].activation = 0.0f;
+        g->nodes[n].activated_by = 0;
+    }
     
     /* Clear old contributions */
     for (uint32_t i = 0; i < g->output_contrib_capacity; i++) {
@@ -5290,36 +5286,47 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
         }
     }
     
-    /* Propagate activation for several steps */
-    /* OPTIMIZATION: For chat (no target), use fewer steps for speed */
-    /* For training (with target), use more steps for better learning */
-    uint32_t num_steps;
-    if (target == NULL || target_len == 0) {
-        /* Chat mode: Fast response, fewer steps */
-        num_steps = input_len * 2;  /* Faster for chat */
-        if (num_steps < 10) num_steps = 10;  /* Minimum for chat */
-        if (num_steps > 50) num_steps = 50;  /* Cap for speed */
-    } else {
-        /* Training mode: More steps for better learning */
-        num_steps = input_len * 3;
-        if (num_steps < 20) num_steps = 20;
-        if (num_steps > 200) num_steps = 200;
-    }
+    /* ========================================================================
+     * NO STEP LIMIT: Run until natural stopping conditions
+     * System decides when to stop via END_MARKER, activation exhaustion, etc.
+     * Emergency cap prevents runaway during learning
+     * ======================================================================== */
     
     /* Compute system state less frequently for chat mode */
     uint32_t state_update_interval = (target == NULL || target_len == 0) ? 5 : 1;
     
-    for (uint32_t step = 0; step < num_steps; step++) {
+    /* Emergency cap: higher for training (with target), lower for generation */
+    uint32_t max_steps = (target != NULL && target_len > 0) ? 1000 : 200;
+    
+    fprintf(stderr, "DEBUG: Starting loop, max_steps=%u, has_target=%d\n", max_steps, (target != NULL));
+    fflush(stderr);
+    
+    for (uint32_t step = 0; step < max_steps; step++) {  /* Emergency cap only */
         /* Compute system state periodically (less frequent for chat) */
         if (step % state_update_interval == 0) {
+            if (step == 0) { fprintf(stderr, "DEBUG: compute_system_state...\n"); fflush(stderr); }
             compute_system_state(g);
+            if (step == 0) { fprintf(stderr, "DEBUG: compute_system_state done\n"); fflush(stderr); }
         }
         
         /* Propagate */
+        if (step == 0) { fprintf(stderr, "DEBUG: propagate_activation...\n"); fflush(stderr); }
         propagate_activation(g);
+        if (step == 0) { fprintf(stderr, "DEBUG: propagate_activation done\n"); fflush(stderr); }
         
         /* Try to output */
+        if (step == 0) {
+            fprintf(stderr, "DEBUG: select_output_node...\n"); fflush(stderr);
+            /* Debug node states before selection */
+            fprintf(stderr, "  Node 'a': exists=%d, act=%.3f\n", g->nodes['a'].exists, g->nodes['a'].activation);
+            fprintf(stderr, "  Node 'b': exists=%d, act=%.3f\n", g->nodes['b'].exists, g->nodes['b'].activation);
+            fprintf(stderr, "  Node 'c': exists=%d, act=%.3f\n", g->nodes['c'].exists, g->nodes['c'].activation);
+            fprintf(stderr, "  Node 'd': exists=%d, act=%.3f\n", g->nodes['d'].exists, g->nodes['d'].activation);
+            fprintf(stderr, "  Node 'o': exists=%d, act=%.3f\n", g->nodes['o'].exists, g->nodes['o'].activation);
+            fprintf(stderr, "  Node 'g': exists=%d, act=%.3f\n", g->nodes['g'].exists, g->nodes['g'].activation);
+        }
         uint32_t output_node = select_output_node(g);
+        if (step == 0) { fprintf(stderr, "DEBUG: select_output_node=%u\n", output_node); fflush(stderr); }
         
         // #region agent log
         FILE *f = fopen("f:\\Melvin_Research\\Melvin_o7\\melvin_o7\\.cursor\\debug.log", "a");
@@ -5341,25 +5348,53 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
         
         /* Check for END_MARKER prediction (learned termination) */
         if (output_node == END_MARKER) {
+            fprintf(stderr, "DEBUG: END_MARKER won at step %u\n", step);
             break;  /* System learned to predict END - stop generating */
         }
         
         /* Check if valid node selected */
         if (output_node < BYTE_VALUES && g->nodes[output_node].exists) {
+            if (step == 0) { fprintf(stderr, "DEBUG: emit_output...\n"); fflush(stderr); }
             emit_output(g, output_node);
+            if (step == 0) { fprintf(stderr, "DEBUG: emit_output done, len=%u\n", g->output_length); fflush(stderr); }
+            
+            /* CRITICAL: Clear input activation after first output */
+            /* Input is CONTEXT (spark), not persistent state */
+            /* After triggering first output, input should not influence later outputs */
+            if (g->output_length == 1) {
+                for (uint32_t in = 0; in < g->input_length; in++) {
+                    uint32_t input_node = g->input_buffer[in];
+                    if (input_node < BYTE_VALUES) {
+                        g->nodes[input_node].activation *= 0.05f;  /* Near-zero */
+                    }
+                }
+            }
         } else {
             /* No valid node selected - activation exhausted */
+            fprintf(stderr, "DEBUG: No valid node at step %u, output_len=%u\n", step, g->output_length);
             if (g->output_length > 0) {
                 break;  /* Have some output, stop */
             }
         }
         
+        if (step == 0) { fprintf(stderr, "DEBUG: Checking stop conditions...\n"); fflush(stderr); }
+        
+        /* Debug every 10 steps */
+        if (step % 10 == 0 && step > 0) {
+            fprintf(stderr, "DEBUG: Step %u, output_len=%u, conf=%.3f\n", 
+                   step, g->output_length, g->state.selection_confidence);
+        }
+        
         /* SELF-REGULATING STOP CONDITIONS (all based on system state) */
+        if (step == 0) { fprintf(stderr, "DEBUG: Stop cond A\n"); fflush(stderr); }
         
         /* Minimum output before self-regulation kicks in */
-        /* System needs to generate enough output to learn patterns */
+        /* Training: reach target length */
+        /* Generation: minimum 3 outputs to allow patterns to develop */
         bool min_output_reached = (target != NULL && target_len > 0) ? 
-            (g->output_length >= target_len) : (g->output_length >= input_len);
+            (g->output_length >= target_len) : (g->output_length >= 3);
+        
+        if (step == 0) { fprintf(stderr, "DEBUG: Stop cond B, min_reached=%d\n", min_output_reached); fflush(stderr); }
         
         /* 1. Confidence collapse: Nothing strong enough to output */
         /* Only stop if confidence is very low AND we've generated minimum output */
@@ -5367,21 +5402,29 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
             break;  /* Low confidence = uncertain what comes next = stop */
         }
         
+        if (step == 0) { fprintf(stderr, "DEBUG: Stop cond C\n"); fflush(stderr); }
+        
         /* 2. Energy depletion: Activation has dissipated */
         if (g->state.activation_energy < 0.005f && min_output_reached) {
             break;  /* No energy left in system = stop */
         }
+        
+        if (step == 0) { fprintf(stderr, "DEBUG: Stop cond D\n"); fflush(stderr); }
         
         /* 3. Loop detection: Stuck in repetitive cycle */
         if (g->state.loop_pressure > 0.95f && g->output_length > 3) {
             break;  /* Stuck in loop = stop */
         }
         
+        if (step == 0) { fprintf(stderr, "DEBUG: Stop cond E\n"); fflush(stderr); }
+        
         /* 4. Completion pressure: Output getting long relative to input */
         /* Only activate after reaching target length (when target exists) */
         if (g->state.completion_pressure > 0.9f && min_output_reached) {
             break;  /* Natural pressure to complete = stop */
         }
+        
+        if (step == 0) { fprintf(stderr, "DEBUG: Stop cond F\n"); fflush(stderr); }
         
         /* 5. TRAINING MODE: Use target length as guide */
         /* Stop at target length to get accurate feedback (learning needs accurate comparison) */
@@ -5391,13 +5434,19 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
             }
         }
         
+        if (step == 0) { fprintf(stderr, "DEBUG: Stop cond G\n"); fflush(stderr); }
+        
         /* NO HARD CAP: System learns to stop via END_MARKER competing as output */
         /* Silence wins when patterns/edges predict END_MARKER more strongly than any byte */
         /* Only safety: extreme runaway prevention (1000+ chars with no learned stopping) */
         if (g->output_length >= 10000) {
             break;  /* Emergency only - system should learn to stop before this */
         }
+        
+        if (step == 0) { fprintf(stderr, "DEBUG: End of loop iteration 0\n"); fflush(stderr); }
     }
+    
+    fprintf(stderr, "DEBUG: After loop\n"); fflush(stderr);
     
     /* ========================================================================
      * SELF-SUPERVISED LEARNING: Data is the answer key
@@ -5410,6 +5459,10 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
         learn_pattern_predictions(g, target, target_len);
         
         /* Create direct input→target edges */
+        /* CRITICAL: Set input context BEFORE creating edges */
+        for (uint32_t i = 0; i < g->input_length; i++) {
+            g->nodes[g->input_buffer[i]].activated_by = BYTE_VALUES;  /* Force INPUT context */
+        }
         for (uint32_t i = 0; i < g->input_length && i < target_len; i++) {
             create_or_strengthen_edge(g, g->input_buffer[i], target[i]);
         }
@@ -5432,8 +5485,9 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
     }
     
     /* 2. Learn from output sequence structure (what we generated) */
-    if (g->output_length > 1) {
-        /* Output sequence structure validates itself */
+    /* ONLY during generation (no target) - don't reinforce wrong outputs during training */
+    if (g->output_length > 1 && (target == NULL || target_len == 0)) {
+        /* Output sequence structure validates itself (in generation mode only) */
         for (uint32_t i = 0; i < g->output_length - 1; i++) {
             /* If output[i] → output[i+1] happened, it's valid structure */
             create_or_strengthen_edge(g, g->output_buffer[i], g->output_buffer[i+1]);
@@ -5442,6 +5496,8 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
     
     /* 3. Hierarchical validation: Higher patterns check lower patterns */
     /* Patterns at deeper levels (more abstract) validate patterns at shallower levels */
+    fprintf(stderr, "DEBUG: Hierarchical validation, pattern_count=%u\n", g->pattern_count);
+    fflush(stderr);
     for (uint32_t p1 = 0; p1 < g->pattern_count; p1++) {
         Pattern *pat1 = &g->patterns[p1];
         if (pat1->chain_depth == 0) continue;  /* Skip root patterns */
@@ -5473,6 +5529,8 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
     
     /* 4. Pattern co-occurrence validation (patterns check each other) */
     /* If patterns co-occur frequently, they validate each other */
+    fprintf(stderr, "DEBUG: Co-occurrence validation...\n");
+    fflush(stderr);
     for (uint32_t p1 = 0; p1 < g->pattern_count; p1++) {
         Pattern *pat1 = &g->patterns[p1];
         if (pat1->activation < pat1->threshold) continue;
@@ -5518,8 +5576,13 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
         }
     }
     
+    fprintf(stderr, "DEBUG: After co-occurrence\n");
+    fflush(stderr);
+    
     /* 5. Self-consistency checking: Patterns validate their own predictions */
     /* If pattern predicts X and X appears in data, pattern validates itself */
+    fprintf(stderr, "DEBUG: Self-consistency checking...\n");
+    fflush(stderr);
     for (uint32_t p = 0; p < g->pattern_count; p++) {
         Pattern *pat = &g->patterns[p];
         if (pat->activation < pat->threshold) continue;
@@ -5560,15 +5623,26 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
         }
     }
     
+    fprintf(stderr, "DEBUG: After self-consistency\n");
+    fflush(stderr);
+    
     /* 6. Pattern detection from data structure (always on, not just supervised) */
     /* Detect patterns in input/output sequences - data structure provides patterns */
+    fprintf(stderr, "DEBUG: Pattern detection, input_len=%u, output_len=%u\n", g->input_length, g->output_length);
+    fflush(stderr);
     if (g->input_length > 1 || g->output_length > 1) {
         detect_patterns(g);  /* Learn patterns from data structure */
     }
+    fprintf(stderr, "DEBUG: After detect_patterns\n");
+    fflush(stderr);
     
     /* 7. Learn propagation and selection parameters from data */
     /* Patterns learn HOW to propagate and HOW to select from what works */
+    fprintf(stderr, "DEBUG: Before learn_prop_selection\n");
+    fflush(stderr);
     learn_propagation_selection_parameters(g, target, target_len);
+    fprintf(stderr, "DEBUG: After learn_prop_selection, DONE!\n");
+    fflush(stderr);
 }
 
 /* ============================================================================
