@@ -26,6 +26,7 @@
 
 #define BYTE_VALUES 256        /* Physical constraint: bytes are 0-255 */
 #define BLANK_NODE 256         /* Wildcard node - matches any byte (for generalization) */
+#define END_MARKER 257         /* Special marker: pattern predicts end of output */
 #define INITIAL_CAPACITY 10000  /* Starting memory allocation (grows as needed) */
 #define INVALID_PATTERN_ID 0xFFFFFFFF  /* Invalid pattern ID (for parent tracking) */
 
@@ -339,6 +340,11 @@ typedef struct {
     
     /* Time (for computing rates) */
     uint64_t step;             /* Global step counter */
+    
+    /* COMPLETION SIGNALS (self-regulating output length) */
+    float selection_confidence;    /* How confident was last output selection */
+    float activation_energy;       /* Total activation in system (normalized) */
+    float completion_pressure;     /* Pressure to stop (grows with output length) */
     
 } SystemState;
 
@@ -670,6 +676,21 @@ void compute_system_state(MelvinGraph *g) {
     g->state.metabolic_pressure = (edge_density + pattern_density) / 2.0f;
     if (g->state.metabolic_pressure > 1.0f) g->state.metabolic_pressure = 1.0f;
     
+    /* ========================================================================
+     * COMPLETION SIGNALS (self-regulating output length)
+     * ======================================================================== */
+    
+    /* Activation energy: Total activation normalized by node density */
+    /* When energy depletes, output should stop */
+    float node_density = (existing_count > 0) ? (float)existing_count / BYTE_VALUES : 0.001f;
+    g->state.activation_energy = total_act / (node_density * BYTE_VALUES + 0.001f);
+    
+    /* Completion pressure: Grows as output extends relative to input */
+    /* Natural pressure to stop as output gets longer */
+    float output_input_ratio = (g->input_length > 0) ? 
+        (float)g->output_length / (float)g->input_length : 0.0f;
+    g->state.completion_pressure = output_input_ratio / (output_input_ratio + 2.0f);  /* Sigmoid-like growth */
+    
     g->state.step++;
 }
 
@@ -854,23 +875,36 @@ void create_or_strengthen_edge(MelvinGraph *g, uint32_t from_id, uint32_t to_id)
         return;  /* Never create edge from node to itself */
     }
     
+    /* Bounds check - from must be valid node, to can be END_MARKER or valid node */
+    if (from_id >= BYTE_VALUES) {
+        return;  /* Can't create edge FROM invalid node */
+    }
+    
+    /* DEBUG */
+    if (to_id == END_MARKER) {
+        fprintf(stderr, "DEBUG: Creating END_MARKER edge from %u\n", from_id);
+    }
+    
     /* UNIDIRECTIONAL ENFORCEMENT: Prevent creating reverse edge if forward exists */
-    /* Check if reverse edge (to→from) already exists */
-    EdgeList *reverse_check = &g->outgoing[to_id];
-    for (uint32_t i = 0; i < reverse_check->count; i++) {
-        if (reverse_check->edges[i].to_id == from_id && reverse_check->edges[i].active) {
-            /* Reverse edge exists! This would create bidirectional pair */
-            /* STRICT RULE: Never allow bidirectional edges */
-            /* Strengthen the existing reverse edge instead */
-            reverse_check->edges[i].use_count++;
-            return;  /* Don't create forward edge - keep unidirectional */
+    /* Check if reverse edge (to→from) already exists - only for byte nodes */
+    if (to_id < BYTE_VALUES) {
+        EdgeList *reverse_check = &g->outgoing[to_id];
+        for (uint32_t i = 0; i < reverse_check->count; i++) {
+            if (reverse_check->edges[i].to_id == from_id && reverse_check->edges[i].active) {
+                /* Reverse edge exists! This would create bidirectional pair */
+                /* STRICT RULE: Never allow bidirectional edges */
+                /* Strengthen the existing reverse edge instead */
+                reverse_check->edges[i].use_count++;
+                return;  /* Don't create forward edge - keep unidirectional */
+            }
         }
     }
+    /* Note: END_MARKER (257) doesn't have outgoing edges, skip reverse check */
     
     /* PORT-AWARE EDGE CREATION: Only create edges within same port */
     /* Cross-port edges are weaker (prevents modality confusion) */
     uint32_t from_port = g->nodes[from_id].source_port;
-    uint32_t to_port = g->nodes[to_id].source_port;
+    uint32_t to_port = (to_id < BYTE_VALUES) ? g->nodes[to_id].source_port : from_port;
     
     /* If ports don't match, reduce edge strength (but still allow learning) */
     float port_penalty = (from_port == to_port) ? 1.0f : 0.3f;
@@ -948,6 +982,7 @@ void create_or_strengthen_edge(MelvinGraph *g, uint32_t from_id, uint32_t to_id)
     e->use_count = 1;
     e->success_count = 0;
     e->active = true;
+    e->is_pattern_edge = false;  /* This is a node edge, not pattern edge */
     
     out->count++;
     
@@ -3901,6 +3936,7 @@ uint32_t select_output_node(MelvinGraph *g) {
      * 1. Check if patterns predict next node (pattern-guided intelligence)
      * 2. If no pattern match, follow strongest edge (greedy fallback)
      * 3. Suppress looping nodes aggressively
+     * 4. END_MARKER competes as a node - silence wins when nothing strong to say
      * 
      * This combines pattern intelligence with edge-based paths
      * ======================================================================== */
@@ -3908,6 +3944,42 @@ uint32_t select_output_node(MelvinGraph *g) {
     uint32_t selected_node = BYTE_VALUES;
     uint32_t source_node = BYTE_VALUES;
     float best_score = 0.0f;
+    
+    /* ========================================================================
+     * END_MARKER COMPETITION: Silence competes like any other output
+     * No threshold - END_MARKER wins when its activation beats all byte nodes
+     * Activation comes from patterns/edges that learned "done" signals
+     * ======================================================================== */
+    float end_marker_score = 0.0f;
+    
+    /* TEMPORARILY DISABLED FOR DEBUGGING
+    for (uint32_t p = 0; p < g->pattern_count; p++) {
+        Pattern *pat = &g->patterns[p];
+        if (pat->activation <= pat->threshold) continue;
+        
+        for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
+            if (pat->predicted_nodes[pred] == END_MARKER) {
+                float contribution = pat->activation * pat->prediction_weights[pred] * pat->strength;
+                if (pat->accumulated_meaning > 0.1f) {
+                    contribution *= (1.0f + pat->accumulated_meaning * 0.1f);
+                }
+                end_marker_score += contribution;
+            }
+        }
+    }
+    
+    if (g->output_length > 0) {
+        uint32_t last_output = g->output_buffer[g->output_length - 1];
+        if (last_output < BYTE_VALUES) {
+            EdgeList *edges = &g->outgoing[last_output];
+            for (uint32_t e = 0; e < edges->count; e++) {
+                if (edges->edges[e].active && edges->edges[e].to_id == END_MARKER) {
+                    end_marker_score += edges->edges[e].weight;
+                }
+            }
+        }
+    }
+    */
     
     /* STEP 1: Check pattern predictions (pattern-guided intelligence) */
     /* Patterns find meaning from highest level (deeper hierarchy = more meaning) */
@@ -4327,6 +4399,38 @@ uint32_t select_output_node(MelvinGraph *g) {
         contrib->total_contribution = 1.0f;
         contrib->pattern_count = 0;
     }
+    
+    /* SELECTION CONFIDENCE: How much does the best score beat alternatives? */
+    /* Used for self-regulating output termination */
+    if (selected_node < BYTE_VALUES) {
+        /* Find second-best score for comparison */
+        float second_best = 0.0f;
+        for (int i = 0; i < BYTE_VALUES; i++) {
+            if (!g->nodes[i].exists || (uint32_t)i == selected_node) continue;
+            float node_score = g->nodes[i].activation;
+            if (node_score > second_best && node_score < best_score) {
+                second_best = node_score;
+            }
+        }
+        
+        /* Confidence = how much best beats second best (relative margin) */
+        float margin = best_score - second_best;
+        float confidence = margin / (best_score + 0.001f);  /* Normalize to [0,1] */
+        g->state.selection_confidence = fmin(confidence, 1.0f);
+    } else {
+        /* No valid selection - zero confidence */
+        g->state.selection_confidence = 0.0f;
+    }
+    
+    /* ========================================================================
+     * FINAL CHECK: Does END_MARKER (silence) beat the best byte node?
+     * No threshold - pure competition. Silence wins when it has more activation.
+     * ======================================================================== */
+    /* TEMPORARILY DISABLED FOR DEBUGGING
+    if (end_marker_score > best_score && end_marker_score > 0.0f) {
+        return END_MARKER;
+    }
+    */
     
     return selected_node;
     
@@ -5041,6 +5145,19 @@ void apply_feedback(MelvinGraph *g, const uint8_t *target, uint32_t target_lengt
         create_or_strengthen_edge(g, target[i], target[i + 1]);
     }
     
+    /* ========================================================================
+     * LEARN END_MARKER: Teach that after last target char, output should END
+     * This is how the system learns to stop - not via hard cap, but via learning
+     * ======================================================================== */
+    if (target_length > 0) {
+        uint32_t last_target_char = target[target_length - 1];
+        fprintf(stderr, "DEBUG: About to create END_MARKER edge from %u\n", last_target_char);
+        fflush(stderr);
+        create_or_strengthen_edge(g, last_target_char, END_MARKER);
+        fprintf(stderr, "DEBUG: END_MARKER edge created successfully\n");
+        fflush(stderr);
+    }
+    
     /* Pattern backpropagation (preserves neural net learning) */
     /* This still runs to maintain pattern hierarchy and internal weight updates */
     for (uint32_t p = 0; p < g->pattern_count; p++) {
@@ -5218,33 +5335,67 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
         }
         // #endregion
         
+        /* ====================================================================
+         * SELF-REGULATING OUTPUT: Stop based on system signals, not hard limits
+         * ==================================================================== */
+        
+        /* Check for END_MARKER prediction (learned termination) */
+        if (output_node == END_MARKER) {
+            break;  /* System learned to predict END - stop generating */
+        }
+        
         /* Check if valid node selected */
         if (output_node < BYTE_VALUES && g->nodes[output_node].exists) {
             emit_output(g, output_node);
+        } else {
+            /* No valid node selected - activation exhausted */
+            if (g->output_length > 0) {
+                break;  /* Have some output, stop */
+            }
         }
-        /* If output_node >= BYTE_VALUES, no valid node was selected */
-        /* This means no nodes have sufficient activation - propagation problem */
         
-        /* Stop if output length matches expected range */
-        /* TRAINING MODE: Stop when we reach target length */
+        /* SELF-REGULATING STOP CONDITIONS (all based on system state) */
+        
+        /* Minimum output before self-regulation kicks in */
+        /* System needs to generate enough output to learn patterns */
+        bool min_output_reached = (target != NULL && target_len > 0) ? 
+            (g->output_length >= target_len) : (g->output_length >= input_len);
+        
+        /* 1. Confidence collapse: Nothing strong enough to output */
+        /* Only stop if confidence is very low AND we've generated minimum output */
+        if (g->state.selection_confidence < 0.01f && min_output_reached) {
+            break;  /* Low confidence = uncertain what comes next = stop */
+        }
+        
+        /* 2. Energy depletion: Activation has dissipated */
+        if (g->state.activation_energy < 0.005f && min_output_reached) {
+            break;  /* No energy left in system = stop */
+        }
+        
+        /* 3. Loop detection: Stuck in repetitive cycle */
+        if (g->state.loop_pressure > 0.95f && g->output_length > 3) {
+            break;  /* Stuck in loop = stop */
+        }
+        
+        /* 4. Completion pressure: Output getting long relative to input */
+        /* Only activate after reaching target length (when target exists) */
+        if (g->state.completion_pressure > 0.9f && min_output_reached) {
+            break;  /* Natural pressure to complete = stop */
+        }
+        
+        /* 5. TRAINING MODE: Use target length as guide */
+        /* Stop at target length to get accurate feedback (learning needs accurate comparison) */
         if (target != NULL && target_len > 0) {
             if (g->output_length >= target_len) {
-                break;  /* Reached target length, stop to get accurate feedback */
+                break;  /* Reached target length, stop for accurate feedback */
             }
-        } else {
-            /* CHAT MODE: Stop after reasonable output */
-            /* Range is relative to input length */
-            float expected_ratio = 1.0f + 0.2f * g->state.error_rate;
-            uint32_t max_output = (uint32_t)(input_len * expected_ratio + 5);
-            
-            if (g->output_length >= max_output) {
-                break;
-            }
-            
-            /* For chat mode, stop early if we have some output */
-            if (g->output_length >= input_len) {
-                break;  /* Got response, stop early */
-            }
+        }
+        
+        /* NO HARD CAP: System learns to stop via END_MARKER competing as output */
+        /* Silence wins when patterns/edges predict END_MARKER more strongly than any byte */
+        /* Only safety: extreme runaway prevention (1000+ chars with no learned stopping) */
+        if (g->output_length >= 10000) {
+            break;  /* Emergency only - system should learn to stop before this */
         }
     }
     
@@ -5760,6 +5911,60 @@ void learn_pattern_predictions(MelvinGraph *g, const uint8_t *target, uint32_t t
                             pat->prediction_weights[pred] /= sum;
                         }
                     }
+                }
+            }
+        }
+    }
+    
+    /* LEARN END MARKER: Patterns that match end of target learn to predict END */
+    /* This allows the system to learn when to stop generating output */
+    for (uint32_t p = 0; p < g->pattern_count; p++) {
+        Pattern *pat = &g->patterns[p];
+        
+        /* Check if pattern matches END of target */
+        if (target_len >= pat->length) {
+            uint32_t end_pos = target_len - pat->length;
+            
+            /* Convert target to node IDs for matching */
+            uint32_t target_nodes[256];
+            uint32_t target_node_len = (target_len < 256) ? target_len : 256;
+            for (uint32_t i = 0; i < target_node_len; i++) {
+                target_nodes[i] = target[i];
+            }
+            
+            if (pattern_matches(g, p, target_nodes, target_node_len, end_pos)) {
+                /* Pattern matches end of target! Learn to predict END_MARKER */
+                
+                /* Find or add END_MARKER prediction */
+                bool found = false;
+                for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
+                    if (pat->predicted_nodes[pred] == END_MARKER) {
+                        /* Strengthen END prediction */
+                        pat->prediction_weights[pred] += 0.3f * g->state.learning_rate;
+                        if (pat->prediction_weights[pred] > 1.0f) {
+                            pat->prediction_weights[pred] = 1.0f;
+                        }
+                        found = true;
+                        break;
+                    }
+                }
+                
+                if (!found) {
+                    /* Add END_MARKER prediction */
+                    if (pat->prediction_count == 0) {
+                        pat->predicted_nodes = malloc(sizeof(uint32_t) * 4);
+                        pat->prediction_weights = malloc(sizeof(float) * 4);
+                        pat->prediction_count = 0;
+                    } else if (pat->prediction_count % 4 == 0) {
+                        pat->predicted_nodes = realloc(pat->predicted_nodes,
+                                                       sizeof(uint32_t) * (pat->prediction_count + 4));
+                        pat->prediction_weights = realloc(pat->prediction_weights,
+                                                          sizeof(float) * (pat->prediction_count + 4));
+                    }
+                    
+                    pat->predicted_nodes[pat->prediction_count] = END_MARKER;
+                    pat->prediction_weights[pat->prediction_count] = 0.5f;  /* Moderate initial weight */
+                    pat->prediction_count++;
                 }
             }
         }
