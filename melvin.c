@@ -37,6 +37,14 @@
 #define DEBUG_PRINT(...) fprintf(stderr, __VA_ARGS__); fflush(stderr)
 #endif
 
+/* Agent log: disable by default (causes massive performance overhead) */
+/* Enable with -DAGENT_LOG when compiling if needed */
+#ifndef AGENT_LOG
+#define SKIP_AGENT_LOG 1
+#else
+#define SKIP_AGENT_LOG 0
+#endif
+
 #define IS_BLANK_NODE(id) ((id) == BLANK_NODE)
 #define MATCHES_BLANK(node_id, pattern_id) (IS_BLANK_NODE(pattern_id) || (node_id == pattern_id))
 
@@ -54,11 +62,6 @@ typedef struct {
     uint8_t payload;           /* The byte value (0-255) this node represents */
     bool exists;               /* Has this node been created? */
     
-    /* PORT TRACKING: Which port (modality) did this node come from? */
-    uint32_t source_port;      /* Port ID where this node originated */
-    /* Port types: 0=text, 1=audio, 2=vision, 3=motor, 4+=custom */
-    /* Nodes track their origin - prevents cross-modality confusion */
-    
     /* Circular Dynamic State (all relative/proportional) */
     float activation;          /* Current activation [0,1] - purely local, calculated per node */
     float threshold;           /* Firing threshold [0,1] - relative to avg */
@@ -73,6 +76,13 @@ typedef struct {
     
     /* NATURAL CONTEXT: What activated this node? */
     uint32_t activated_by;     /* Node ID that caused this activation (BYTE_VALUES = input) */
+
+    /* BIOLOGICAL: Gradual adaptation (fatigue) instead of instant death */
+    /* Inspired by: Neural adaptation, refractory periods, CPG fatigue */
+    float adaptation;          /* Accumulated fatigue [0,1] - grows with use, recovers with rest */
+                               /* RELATIVE: Proportional to contribution and pattern support */
+                               /* INFLUENCES: Reduces activation (activation *= 1-adaptation) */
+                               /* INFLUENCED BY: Firing, pattern membership, recovery rate */
 
 } Node;
 
@@ -169,14 +179,7 @@ typedef struct {
     float bias;                 /* Bias term (like b in neural net) */
     uint32_t input_size;        /* Number of input nodes this pattern processes */
     
-    /* PORT TRACKING: Pattern learned from specific port relationships */
-    uint32_t input_port;        /* Port where pattern's input nodes came from */
-    uint32_t output_port;       /* Port where pattern's predictions go */
-    /* Patterns learn port-to-port relationships (text→text, audio→audio) */
-    /* Prevents confusion: same bytes mean different things in different ports */
-    /* Example: byte 65 from TEXT port = 'A', from AUDIO port = frequency value */
-    
-    /* MODALITY CONTEXT: Also store context vector for fine-grained matching */
+    /* MODALITY CONTEXT: Store context vector for fine-grained matching */
     float context_vector[16];   /* Context encoding when pattern was learned */
     
     /* PATTERN-TO-PATTERN CONNECTIONS: Patterns connect to other patterns (like nodes) */
@@ -418,9 +421,7 @@ typedef struct {
     OutputContribution *output_contributions;
     uint32_t output_contrib_capacity;
     
-    /* PORT TRACKING: Current input/output ports */
-    uint32_t current_input_port;   /* Current input port (0=text, 1=audio, etc.) */
-    uint32_t current_output_port;  /* Current output port */
+    /* Universal input/output - ports handle conversion externally */
     
     /* UNIVERSAL POSITIONAL PATTERN HISTORY: Track recent inputs for positional pattern detection */
     /* This enables both sequential AND positional patterns to work universally */
@@ -444,9 +445,7 @@ float compute_firing_probability(MelvinGraph *g, uint32_t node_id);
 float compute_node_relevance(MelvinGraph *g, uint32_t node_id);
 float melvin_get_edge_weight(MelvinGraph *g, uint32_t from_id, uint32_t to_id);
 void melvin_set_context(MelvinGraph *g, float *context);
-void melvin_set_input_port(MelvinGraph *g, uint32_t port_id);
-void melvin_set_output_port(MelvinGraph *g, uint32_t port_id);
-void inject_input_from_port(MelvinGraph *g, const uint8_t *bytes, uint32_t length, uint32_t port_id);
+/* Port functions removed - ports handle conversion externally in melvin_ports.c */
 int melvin_save_brain(MelvinGraph *g, const char *filename);
 MelvinGraph* melvin_load_brain(const char *filename);
 void melvin_destroy(MelvinGraph *g);
@@ -485,10 +484,10 @@ MelvinGraph* melvin_create(void) {
         g->nodes[i].activation = 0.0f;
         g->nodes[i].threshold = 0.5f;    /* Start at midpoint */
         g->nodes[i].prev_activation = 0.0f;
+        g->nodes[i].adaptation = 0.0f;   /* No fatigue initially */
         g->nodes[i].activation_momentum = 0.0f;
         g->nodes[i].fire_count = 0;
         g->nodes[i].receive_count = 0;
-        g->nodes[i].source_port = 0;  /* Default port */
     }
     
     /* Initialize edge lists */
@@ -924,12 +923,7 @@ void create_or_strengthen_edge(MelvinGraph *g, uint32_t from_id, uint32_t to_id)
     /* Example: 'a'→'c' (input→output) AND 'c'→'a' (sequence) are both valid */
     
     /* PORT-AWARE EDGE CREATION: Only create edges within same port */
-    /* Cross-port edges are weaker (prevents modality confusion) */
-    uint32_t from_port = g->nodes[from_id].source_port;
-    uint32_t to_port = (to_id < BYTE_VALUES) ? g->nodes[to_id].source_port : from_port;
-    
-    /* If ports don't match, reduce edge strength (but still allow learning) */
-    float port_penalty = (from_port == to_port) ? 1.0f : 0.3f;
+    /* Universal edges - no port tracking (ports handle conversion externally) */
     EdgeList *out = &g->outgoing[from_id];
     
     /* Find existing edge */
@@ -938,7 +932,6 @@ void create_or_strengthen_edge(MelvinGraph *g, uint32_t from_id, uint32_t to_id)
             /* SELF-ADJUSTING: Strengthen edge based on usage and success */
             /* Growth rate depends on:
              * - Learning rate (how fast system learns)
-             * - Port penalty (same port = faster)
              * - Usage (more use = faster growth)
              * - Success rate (correct predictions = faster growth)
              */
@@ -962,7 +955,7 @@ void create_or_strengthen_edge(MelvinGraph *g, uint32_t from_id, uint32_t to_id)
             /* Otherwise keep original context - edges remember their origin */
             
             /* Base growth rate */
-            float base_growth = 0.1f * g->state.learning_rate * port_penalty;
+            float base_growth = 0.1f * g->state.learning_rate;
             
             /* Usage boost: More use = faster growth (log scale) */
             float usage_boost = logf(1.0f + out->edges[i].use_count) / 10.0f;
@@ -1016,7 +1009,7 @@ void create_or_strengthen_edge(MelvinGraph *g, uint32_t from_id, uint32_t to_id)
     Edge *e = &out->edges[out->count];
     e->to_id = to_id;
     /* SELF-ADJUSTING: Start with base weight, grows through usage */
-    e->weight = 0.5f * port_penalty; /* Start at 0.5 (or 0.15 for cross-port) */
+    e->weight = 0.5f; /* Start at 0.5 */
     e->use_count = 1;
     e->success_count = 0;
     e->active = true;
@@ -1129,21 +1122,7 @@ bool pattern_matches(MelvinGraph *g, uint32_t pattern_id, const uint32_t *sequen
     }
     
     /* AUTO-LEARNED PORT CHECK: Check ports from actual nodes in sequence */
-    /* Ports are learned from node source_port - no manual setting needed */
-    /* Pattern matches if sequence nodes have matching ports */
-    if (start_pos < seq_len && sequence[start_pos] < BYTE_VALUES) {
-        /* Check if sequence nodes match pattern's learned port */
-        /* Get port from first non-blank node in pattern (for positional) or first node (for sequential) */
-        uint32_t check_pos = is_positional_pattern ? first_non_blank_pos : start_pos;
-        if (check_pos < seq_len && sequence[check_pos] < BYTE_VALUES) {
-            uint32_t seq_port = g->nodes[sequence[check_pos]].source_port;
-            /* Pattern matches if it learned from the same port as the sequence */
-            /* This allows automatic port differentiation without manual setting */
-            if (pat->input_port != seq_port) {
-                return false;  /* Port mismatch - pattern learned from different port */
-            }
-        }
-    }
+    /* Universal pattern matching - no port tracking (ports handle conversion externally) */
     
     /* Also check context similarity for fine-grained matching */
     float context_sim = context_similarity(pat->context_vector, g->state.context_vector);
@@ -1378,6 +1357,64 @@ void propagate_pattern_activation(MelvinGraph *g) {
                         p, net_output, pat->strength, context_boost, pat->activation, pat->threshold);
             }
             
+            /* LOCAL COMPETITION: Pattern competes with patterns that predict same nodes */
+            /* Direct competition: patterns that predict same nodes compete locally */
+            float local_competition_strength = 0.0f;
+            uint32_t local_competitor_count = 0;
+            
+            /* Find patterns that predict same nodes (direct competitors) */
+            for (uint32_t p2 = 0; p2 < g->pattern_count; p2++) {
+                if (p2 == p) continue;  /* Don't compete with self */
+                Pattern *competitor = &g->patterns[p2];
+                
+                /* Check if competitor predicts any of the same nodes */
+                bool competes = false;
+                for (uint32_t pred1 = 0; pred1 < pat->prediction_count; pred1++) {
+                    for (uint32_t pred2 = 0; pred2 < competitor->prediction_count; pred2++) {
+                        if (pat->predicted_nodes[pred1] == competitor->predicted_nodes[pred2]) {
+                            competes = true;
+                            break;
+                        }
+                    }
+                    if (competes) break;
+                }
+                
+                /* If competitor predicts same nodes and is active, it's local competition */
+                if (competes && competitor->activation > 0.0f) {
+                    local_competition_strength += competitor->activation * competitor->strength;
+                    local_competitor_count++;
+                }
+            }
+            
+            /* LOCAL ADAPTATION: Threshold adapts to local competition */
+            /* High local competition = need higher activation to compete = higher threshold */
+            /* Low local competition = easier to activate = lower threshold */
+            float avg_local_competition = (local_competitor_count > 0) ?
+                (local_competition_strength / local_competitor_count) : 0.0f;
+            
+            /* Pattern's own fitness (local to itself) */
+            float my_success_rate = (pat->prediction_attempts > 0) ?
+                ((float)pat->prediction_successes / (float)pat->prediction_attempts) : 0.5f;
+            
+            /* Threshold = base + competition adjustment - success bonus */
+            /* Successful patterns can activate easier (lower threshold) */
+            /* High competition requires higher activation (higher threshold) */
+            float base_threshold = 0.3f;  /* Local base, not global */
+            float competition_adjustment = avg_local_competition * 0.3f;  /* More competition = higher threshold */
+            float success_bonus = (1.0f - my_success_rate) * 0.2f;  /* Low success = higher threshold */
+            
+            pat->threshold = base_threshold + competition_adjustment - success_bonus;
+            if (pat->threshold < 0.1f) pat->threshold = 0.1f;
+            if (pat->threshold > 0.9f) pat->threshold = 0.9f;
+            
+            /* LOCAL STRENGTH EVOLUTION: Pattern strength evolves based on own success */
+            /* No global comparison - just: am I getting better or worse? */
+            float target_strength = my_success_rate;  /* Aim for my own success rate */
+            float strength_error = target_strength - pat->strength;
+            pat->strength += 0.01f * strength_error;  /* Small continuous change */
+            if (pat->strength < 0.01f) pat->strength = 0.01f;
+            if (pat->strength > 1.0f) pat->strength = 1.0f;
+            
             /* Pattern activation bounded by threshold (no energy constraint) */
             
             /* Pattern predicts next nodes (micro neural net output) */
@@ -1390,7 +1427,8 @@ void propagate_pattern_activation(MelvinGraph *g) {
                     if (target_node < BYTE_VALUES && !g->nodes[target_node].exists) {
                         g->nodes[target_node].exists = true;
                         g->nodes[target_node].activation = 0.0f;
-                        g->nodes[target_node].threshold = g->state.avg_threshold;
+                        g->nodes[target_node].threshold = 0.5f;  /* Local default, not global */
+                        g->nodes[target_node].adaptation = 0.0f;
                     }
                     
                     /* Pattern activation spreads to predicted nodes */
@@ -1408,9 +1446,9 @@ void propagate_pattern_activation(MelvinGraph *g) {
                         /* INTELLIGENT PATH: Patterns are learned paths - follow them STRONGLY */
                         /* Patterns are learned intelligence - they predict where activation should go */
                         /* Transfer based on pattern activation, prediction weight, and pattern strength */
-                        /* Patterns start at 1.0 weight, so no artificial boost needed */
-                        float transfer = pat->activation * weight * pat->strength;
-                        /* No boost - pattern weight is already 1.0 (full strength) */
+                        /* LOCAL COMPETITION: Stronger patterns (higher success) transfer more */
+                        float competition_boost = 1.0f + (my_success_rate - 0.5f) * 2.0f;  /* [0, 2] range */
+                        float transfer = pat->activation * weight * pat->strength * competition_boost;
                         
                         g->nodes[target_node].activation += transfer;
                         g->nodes[target_node].receive_count++;
@@ -2519,7 +2557,32 @@ uint32_t propagate_with_coherence(MelvinGraph *g) {
         }
     }
     
-    /* Fourth: Apply new activations and find best coherent node */
+    /* Fourth: Apply new activations and find best node */
+    
+    /* ========================================================================
+     * SELF-REGULATING WAVE PROPAGATION SELECTION
+     * 
+     * Wave propagation (new_activations) IS the intelligence - it uses edges
+     * and patterns to determine what should fire next. History (old activation)
+     * provides momentum and context.
+     * 
+     * The balance between wave prop and history emerges from signal strength:
+     * - Strong wave prop signals = trust the graph's learned structure
+     * - Weak wave prop signals = trust accumulated momentum
+     * 
+     * No hardcoded weights - the signals self-regulate
+     * ======================================================================== */
+    
+    /* Measure total wave propagation energy */
+    float total_wave_energy = 0.0f;
+    float total_history_energy = 0.0f;
+    for (uint32_t i = 0; i < BYTE_VALUES; i++) {
+        if (g->nodes[i].exists) {
+            total_wave_energy += new_activations[i];
+            total_history_energy += g->nodes[i].activation;
+        }
+    }
+    
     for (uint32_t i = 0; i < BYTE_VALUES; i++) {
         if (!g->nodes[i].exists && new_activations[i] < 0.001f) continue;
         
@@ -2527,15 +2590,46 @@ uint32_t propagate_with_coherence(MelvinGraph *g) {
         if (!g->nodes[i].exists) {
             g->nodes[i].exists = true;
             g->nodes[i].activation = 0.0f;
+            g->nodes[i].adaptation = 0.0f;
+        }
+        
+        /* ====================================================================
+         * BIOLOGICAL ADAPTATION RECOVERY
+         * ==================================================================== */
+        
+        float total_activation = g->nodes[i].activation + new_activations[i];
+        if (total_activation < 0.2f && g->nodes[i].adaptation > 0.0f) {
+            float inactivity = 1.0f - fminf(total_activation, 1.0f);
+            float recovery_rate = 0.15f * inactivity;
+            g->nodes[i].adaptation *= (1.0f - recovery_rate);
+            if (g->nodes[i].adaptation < 0.01f) {
+                g->nodes[i].adaptation = 0.0f;
+            }
         }
         
         /* Decay old activation */
-        g->nodes[i].activation *= 0.5f;
+        float base_decay = 0.3f;
+        float fatigue_decay = g->nodes[i].adaptation * 0.2f;
+        float decay_rate = base_decay + fatigue_decay;
+        g->nodes[i].activation *= (1.0f - decay_rate);
+        
+        /* Store old activation before update */
+        float history_signal = g->nodes[i].activation;
         
         /* Add new activation */
         g->nodes[i].activation += new_activations[i];
         
-        /* Skip input nodes for output (they're context, not output) */
+        /* ====================================================================
+         * BIOLOGICAL PRINCIPLE: Input ≠ Output
+         * 
+         * Input nodes are SENSORY (context that activates patterns)
+         * Output nodes are MOTOR (what the system generates)
+         * This is like: hearing "hello" → saying "world" (not echoing "hello")
+         * 
+         * Input activates patterns → patterns drive output
+         * Same mechanism for every decision, but input nodes don't output
+         * ==================================================================== */
+        
         bool is_input = false;
         for (uint32_t in = 0; in < g->input_length; in++) {
             if (g->input_buffer[in] == i) {
@@ -2553,10 +2647,27 @@ uint32_t propagate_with_coherence(MelvinGraph *g) {
             recently_output = true;
         }
         
-        /* Compute selection score: coherence × activation */
-        /* Coherent nodes with high activation win */
-        if (!is_input && !recently_output) {
-            float score = node_coherence[i] * g->nodes[i].activation;
+        if (!is_input && !recently_output && g->nodes[i].activation > 0.001f) {
+            /* ================================================================
+             * SELF-REGULATING BALANCE
+             * 
+             * Score = (wave_signal × wave_confidence) + (history × history_confidence)
+             * 
+             * Confidences emerge from relative energy:
+             * - If wave prop is strong, it dominates
+             * - If wave prop is weak, history matters more
+             * - No hardcoded percentages - pure relative balance
+             * ================================================================ */
+            
+            float wave_signal = new_activations[i];
+            float wave_confidence = (total_wave_energy > 0.01f) 
+                ? (total_wave_energy / (total_wave_energy + total_history_energy + 0.001f))
+                : 0.0f;
+            
+            float history_confidence = 1.0f - wave_confidence;
+            
+            /* Selection score emerges from both signals */
+            float score = (wave_signal * wave_confidence) + (history_signal * history_confidence);
             
             if (score > best_coherence_score) {
                 best_coherence_score = score;
@@ -2581,6 +2692,24 @@ uint32_t propagate_with_coherence(MelvinGraph *g) {
     /* If END_MARKER is most coherent, return it */
     if (end_marker_coherence > best_coherence_score) {
         return END_MARKER;
+    }
+    
+    /* FALLBACK: If no valid node found and no output yet, allow input nodes */
+    /* This prevents infinite loops on first step when only input nodes have activation */
+    if (best_node >= BYTE_VALUES && g->output_length == 0) {
+        /* Find any node with activation (including input nodes) */
+        float max_act = 0.0f;
+        uint32_t fallback_node = BYTE_VALUES;
+        for (uint32_t i = 0; i < BYTE_VALUES; i++) {
+            if (!g->nodes[i].exists) continue;
+            if (g->nodes[i].activation > max_act) {
+                max_act = g->nodes[i].activation;
+                fallback_node = i;
+            }
+        }
+        if (fallback_node < BYTE_VALUES && max_act > 0.01f) {
+            return fallback_node;  /* Use input node as fallback on first step */
+        }
     }
     
     return best_node;
@@ -2956,12 +3085,44 @@ void propagate_activation(MelvinGraph *g) {
                     continue;
                 }
                 
-                /* CIRCULAR INTEGRATION: Pattern activation multiplies edge strength */
-                /* Active patterns make their edges more effective (1.0 + activation) */
-                /* ADAPTIVE: Coupling strength based on learning rate and competition */
-                /* High learning = patterns matter more, high competition = patterns matter less */
-                float coupling_base = g->state.learning_rate * (1.0f - g->state.competition_pressure * 0.5f);
-                float pattern_influence = 1.0f + (pat->activation * coupling_base);
+                /* LOCAL COMPETITION: Pattern coupling based on own success vs local neighbors */
+                /* Pattern only knows its own success rate and local competition */
+                float my_success = (pat->prediction_attempts > 0) ?
+                    ((float)pat->prediction_successes / (float)pat->prediction_attempts) : 0.5f;
+                
+                /* Local competition: how strong are competing patterns for this edge? */
+                float local_edge_competition = 0.0f;
+                uint32_t competing_patterns = 0;
+                for (uint32_t p2 = 0; p2 < g->pattern_count && p2 < 500; p2++) {
+                    if (p2 == p) continue;
+                    Pattern *pat2 = &g->patterns[p2];
+                    /* Check if this pattern also supports this edge */
+                    bool pat2_supports = false;
+                    for (uint32_t idx = 0; idx + 1 < pat2->length; idx++) {
+                        if (pat2->node_ids[idx] == (uint32_t)i && pat2->node_ids[idx + 1] == target) {
+                            pat2_supports = true;
+                            break;
+                        }
+                    }
+                    if (pat2_supports && pat2->activation > pat2->threshold) {
+                        float pat2_success = (pat2->prediction_attempts > 0) ?
+                            ((float)pat2->prediction_successes / (float)pat2->prediction_attempts) : 0.5f;
+                        local_edge_competition += pat2->activation * pat2_success;
+                        competing_patterns++;
+                    }
+                }
+                
+                /* Coupling strength = my success relative to local competition */
+                /* High success + low competition = strong coupling */
+                /* Low success + high competition = weak coupling */
+                float avg_competition = (competing_patterns > 0) ?
+                    (local_edge_competition / competing_patterns) : 0.0f;
+                float relative_fitness = (avg_competition > 0.001f) ?
+                    (my_success / (avg_competition + 0.001f)) : my_success * 2.0f;
+                
+                /* Coupling = relative fitness (local comparison only) */
+                float coupling_strength = fmin(relative_fitness, 3.0f);  /* Cap at 3x */
+                float pattern_influence = 1.0f + (pat->activation * coupling_strength * 0.5f);
                 pattern_boost *= pattern_influence;  /* Multiplicative: patterns compound */
                 total_pattern_activation += pat->activation;
                 
@@ -3073,6 +3234,7 @@ void propagate_activation(MelvinGraph *g) {
                 g->nodes[target].exists = true;
                 g->nodes[target].activation = 0.0f;
                 g->nodes[target].threshold = g->state.avg_threshold;
+                g->nodes[target].adaptation = 0.0f;
             }
             
             /* Transfer activation proportional to path quality (normalized) */
@@ -3651,11 +3813,8 @@ void create_pattern_edges_from_coactivation(MelvinGraph *g) {
             Pattern *pat_a = &g->patterns[pat_a_id];
             Pattern *pat_b = &g->patterns[pat_b_id];
             
-            /* PORT CHECK: Patterns from different ports get weaker connections */
-            float port_penalty = (pat_a->input_port == pat_b->input_port) ? 1.0f : 0.3f;
-            
             /* Co-activation strength */
-            float coactivation_strength = pat_a->activation * pat_b->activation * port_penalty;
+            float coactivation_strength = pat_a->activation * pat_b->activation;
             
             /* CONFIDENCE SIMILARITY: Patterns with similar confidence connect more strongly */
             /* High-confidence patterns naturally cluster together (they "know" together) */
@@ -3699,63 +3858,56 @@ void create_pattern_edges_from_coactivation(MelvinGraph *g) {
  * ============================================================================ */
 
 void inject_input(MelvinGraph *g, const uint8_t *bytes, uint32_t length) {
-    /* AUTO-LEARNED PORTS: Use current input port (learned from last injection) */
-    /* Default: port 0, but automatically tracks from injection context */
-    inject_input_from_port(g, bytes, length, g->current_input_port);
-}
+    /* ========================================================================
+     * UNIVERSAL INPUT INJECTION
+     * 
+     * Input nodes receive initial activation to participate in wave propagation
+     * RELATIVE: Activation proportional to position (recency)
+     * SELF-REGULATING: Balanced with patterns through wave propagation
+     * ======================================================================== */
 
-/* AUTO-LEARNING: Ports are automatically set when input is injected */
-/* This is the simplest way - ports come with the data, no separate function needed */
-
-void inject_input_from_port(MelvinGraph *g, const uint8_t *bytes, uint32_t length, uint32_t port_id) {
-    /* AUTO-LEARNED PORTS: Port is automatically set from injection */
-    /* This updates the current port context for wave prop to learn from */
-    g->current_input_port = port_id;
-    g->current_output_port = port_id;  /* Default: same port (can be overridden if needed) */
-    
-    /* Grow input buffer if needed */
-    while (g->input_length + length > g->input_capacity) {
-        g->input_capacity *= 2;
+    /* Ensure input buffer has capacity */
+    if (g->input_length + length > g->input_capacity) {
+        while (g->input_length + length > g->input_capacity) {
+            g->input_capacity *= 2;
+        }
         g->input_buffer = realloc(g->input_buffer, sizeof(uint32_t) * g->input_capacity);
     }
-    
-    /* Add to input buffer */
-    for (uint32_t i = 0; i < length; i++) {
-        g->input_buffer[g->input_length++] = bytes[i];
-    }
-    
-    /* Inject activation into corresponding nodes */
-    for (uint32_t i = 0; i < length; i++) {
-        uint8_t byte = bytes[i];
-        
-        /* Create node if doesn't exist */
-        if (!g->nodes[byte].exists) {
-            g->nodes[byte].exists = true;
-            g->nodes[byte].activation = 0.0f;
-            g->nodes[byte].threshold = g->state.avg_threshold;
-            /* AUTO-LEARNED PORT: Node learns its port from injection */
-            g->nodes[byte].source_port = port_id;
-        } else {
-            /* Existing node: port might change if reused across modalities */
-            /* Keep original port (first port it was seen with) */
-            /* This allows nodes to have a "primary" port but still work across ports */
-        }
-        
-        /* Injection strength relative to exploration pressure */
-        /* High exploration = stronger injection (force attention) */
-        float injection_strength = 0.5f + 0.5f * g->state.exploration_pressure;
-        
-        /* Add activation (purely local) */
-        g->nodes[byte].activation += injection_strength;
-        g->nodes[byte].activated_by = BYTE_VALUES;  /* Special: activated by INPUT */
 
-        /* Create sequential edges (Hebbian: this byte followed that byte) */
-        if (i > 0) {
-            uint8_t prev_byte = bytes[i - 1];
-            create_or_strengthen_edge(g, prev_byte, byte);
+    /* ========================================================================
+     * INPUT ACTIVATION STRATEGY
+     * 
+     * For sequence generation, EARLIER positions need MORE activation
+     * (generate in order: first → second → third...)
+     * 
+     * But not so high that patterns can't contribute
+     * RELATIVE: Position-based gradient
+     * ======================================================================== */
+    
+    float base_input_activation = 1.0f;
+    
+    /* Store input bytes and activate nodes */
+    for (uint32_t i = 0; i < length; i++) {
+        uint32_t node_id = (uint32_t)bytes[i];
+        g->input_buffer[g->input_length++] = node_id;
+
+        /* Create node if doesn't exist */
+        if (!g->nodes[node_id].exists) {
+            g->nodes[node_id].exists = true;
+            g->nodes[node_id].activation = 0.0f;
+            g->nodes[node_id].threshold = g->state.avg_threshold;
+            g->nodes[node_id].adaptation = 0.0f;
         }
+        
+        /* SEQUENTIAL ACTIVATION: First items get MORE activation */
+        /* This naturally produces sequential output */
+        float position_factor = 1.5f - ((float)i / (float)length) * 0.5f;  /* 1.5 → 1.0 */
+        g->nodes[node_id].activation += base_input_activation * position_factor;
     }
 }
+
+/* Port conversion handled externally in melvin_ports.c */
+/* melvin.c only sees universal bytes - ports convert to/from modalities */
 
 /* ============================================================================
  * UNIVERSAL POSITIONAL PATTERN DETECTION
@@ -3862,7 +4014,7 @@ void detect_positional_patterns(MelvinGraph *g) {
                     pos_pat->pattern_prediction_weights = NULL;
                     pos_pat->pattern_prediction_count = 0;
                     initialize_pattern_enhancements(pos_pat);
-                    pos_pat->threshold = g->state.avg_threshold;
+                    pos_pat->threshold = 0.3f;  /* Local default, not global */
                     pos_pat->input_weights = NULL;
                     pos_pat->bias = 0.0f;
                     pos_pat->input_size = 0;
@@ -3879,14 +4031,7 @@ void detect_positional_patterns(MelvinGraph *g) {
                     pos_pat->chain_depth = 0;
                     pos_pat->accumulated_meaning = 0.0f;
                     
-                    /* Port from node */
-                    if (val < BYTE_VALUES && g->nodes[val].exists) {
-                        pos_pat->input_port = g->nodes[val].source_port;
-                        pos_pat->output_port = g->nodes[val].source_port;
-                    } else {
-                        pos_pat->input_port = g->current_input_port;
-                        pos_pat->output_port = g->current_output_port;
-                    }
+                    /* Universal pattern - no port tracking (ports handle conversion externally) */
                     for (int i = 0; i < 16; i++) {
                         pos_pat->context_vector[i] = g->state.context_vector[i];
                     }
@@ -4016,7 +4161,7 @@ void detect_patterns(MelvinGraph *g) {
                     blank_pat->pattern_prediction_weights = NULL;
                     blank_pat->pattern_prediction_count = 0;
                     initialize_pattern_enhancements(blank_pat);
-                    blank_pat->threshold = g->state.avg_threshold;
+                    blank_pat->threshold = 0.3f;  /* Local default, not global */
                     blank_pat->input_weights = NULL;
                     blank_pat->bias = 0.0f;
                     blank_pat->input_size = 0;
@@ -4030,20 +4175,7 @@ void detect_patterns(MelvinGraph *g) {
                     blank_pat->last_fired_step = 0;
                     blank_pat->fired_predictions = 0;
                     
-                    /* Ports: learn from concrete positions */
-                    uint32_t port_counts[256] = {0};
-                    if (a < BYTE_VALUES) port_counts[g->nodes[a].source_port]++;
-                    if (b < BYTE_VALUES) port_counts[g->nodes[b].source_port]++;
-                    uint32_t most_common_port = 0;
-                    uint32_t max_port_count = 0;
-                    for (uint32_t p = 0; p < 256; p++) {
-                        if (port_counts[p] > max_port_count) {
-                            max_port_count = port_counts[p];
-                            most_common_port = p;
-                        }
-                    }
-                    blank_pat->input_port = most_common_port;
-                    blank_pat->output_port = most_common_port;
+                    /* Universal pattern - no port tracking (ports handle conversion externally) */
                     for (int i = 0; i < 16; i++) {
                         blank_pat->context_vector[i] = g->state.context_vector[i];
                     }
@@ -4144,8 +4276,8 @@ void detect_patterns(MelvinGraph *g) {
                 initialize_pattern_enhancements(pat);
                 
                 /* Initialize relative to system state */
-                pat->threshold = g->state.avg_threshold;
-                
+                pat->threshold = 0.3f;  /* Local default, adapts via local competition */
+
                 /* Initialize neural net components */
                 pat->input_weights = NULL;
                 pat->bias = 0.0f;  /* Start at 0, like simple neural net */
@@ -4200,29 +4332,7 @@ void detect_patterns(MelvinGraph *g) {
                 pat->last_fired_step = 0;
                 pat->fired_predictions = 0;
                 
-                /* PORT AUTO-LEARNING: Pattern learns ports from the nodes it's built from */
-                /* Ports are automatically derived from node source_port (no manual setting needed) */
-                /* Find most common port among pattern's nodes */
-                uint32_t port_counts[256] = {0};  /* Count ports (assume max 256 ports) */
-                for (uint32_t i = 0; i < pat->length; i++) {
-                    if (pat->node_ids[i] < BYTE_VALUES && pat->node_ids[i] != BLANK_NODE) {
-                        uint32_t node_port = g->nodes[pat->node_ids[i]].source_port;
-                        port_counts[node_port]++;
-                    }
-                }
-                /* Find most common port */
-                uint32_t most_common_port = 0;
-                uint32_t max_count = 0;
-                for (uint32_t p = 0; p < 256; p++) {
-                    if (port_counts[p] > max_count) {
-                        max_count = port_counts[p];
-                        most_common_port = p;
-                    }
-                }
-                pat->input_port = most_common_port;
-                
-                /* Output port: learn from predicted nodes (if any) or default to input port */
-                pat->output_port = most_common_port;  /* Default: same as input */
+                /* Universal pattern - no port tracking (ports handle conversion externally) */
                 
                 /* Also store context for backward compatibility */
                 for (int i = 0; i < 16; i++) {
@@ -5717,12 +5827,7 @@ void emit_output(MelvinGraph *g, uint32_t node_id) {
     /* Add to output */
     g->output_buffer[g->output_length++] = node_id;
     
-    /* PORT TRACKING: Output nodes inherit output port */
-    /* This allows patterns to learn which port their predictions go to */
-    if (g->nodes[node_id].exists) {
-        /* Output node should match output port (for pattern learning) */
-        g->nodes[node_id].source_port = g->current_output_port;
-    }
+    /* Universal output - ports handle conversion externally */
     
     /* SELF-TUNING FIX 4: Track output history for variance and loop detection */
     g->state.recent_outputs[g->state.output_history_index % 50] = node_id;
@@ -5799,10 +5904,110 @@ void emit_output(MelvinGraph *g, uint32_t node_id) {
         if (g->state.loop_pressure < 0.01f) g->state.loop_pressure = 0.0f;
     }
     
-    /* Reduce activation (refractory period) */
-    g->nodes[node_id].activation *= 0.3f;
-    /* Node activation decays after output (refractory period) */
-    g->nodes[node_id].activation *= 0.3f;
+    /* ========================================================================
+     * BIOLOGICAL ADAPTATION (not static decay)
+     * 
+     * Inspired by: Neural adaptation, CPG fatigue, refractory periods
+     * 
+     * Key insights from biology:
+     * 1. Neurons don't die instantly - they gradually fatigue
+     * 2. While fatiguing, they still support the NEXT node in sequence
+     * 3. Patterns are recurrent structures that sustain their members
+     * 4. Sequence completion is natural, not forced
+     * 
+     * RELATIVE: Adaptation rate proportional to contribution and pattern support
+     * INFLUENCES: Reduces own activation, but sustains pattern members
+     * INFLUENCED BY: Pattern membership, edge weights, system state
+     * ======================================================================== */
+    
+    /* 1. COMPUTE PATTERN SUPPORT for this node */
+    /* Nodes that are part of active patterns fatigue slower (recurrent support) */
+    float pattern_support = 0.0f;
+    uint32_t supporting_patterns = 0;
+    
+    for (uint32_t p = 0; p < g->pattern_count; p++) {
+        Pattern *pat = &g->patterns[p];
+        if (pat->activation <= pat->threshold) continue;
+        
+        /* Check if this node is in the pattern */
+        for (uint32_t i = 0; i < pat->length; i++) {
+            if (MATCHES_BLANK(node_id, pat->node_ids[i])) {
+                /* Node is in active pattern - pattern provides support */
+                pattern_support += pat->activation * pat->strength;
+                supporting_patterns++;
+                break;
+            }
+        }
+    }
+    
+    /* 2. GRADUAL ADAPTATION (fatigue) - RELATIVE to pattern support */
+    /* More pattern support = slower adaptation (patterns sustain their members) */
+    float base_adaptation_rate = 0.15f;  /* Base fatigue rate (reduced from 0.3) */
+    float support_factor = 1.0f / (1.0f + pattern_support * 2.0f);  /* More support = less fatigue */
+    float adaptation_rate = base_adaptation_rate * support_factor;
+    
+    /* Accumulate adaptation (fatigue) - proportional, not instant */
+    g->nodes[node_id].adaptation += adaptation_rate;
+    if (g->nodes[node_id].adaptation > 0.8f) g->nodes[node_id].adaptation = 0.8f;  /* Cap at 80% to prevent total death */
+    
+    /* Apply adaptation to activation - gradual reduction, not instant kill */
+    /* Key: Node still has SOME activation to support next nodes in sequence */
+    /* Even at max adaptation (0.8), node keeps 44% of activation (1.0 - 0.8*0.7) */
+    g->nodes[node_id].activation *= (1.0f - g->nodes[node_id].adaptation * 0.7f);
+    
+    /* 3. RECURRENT PATTERN SUPPORT: Active patterns sustain their upcoming members */
+    /* This is the key biological mechanism - learned structure maintains sequence */
+    for (uint32_t p = 0; p < g->pattern_count; p++) {
+        Pattern *pat = &g->patterns[p];
+        if (pat->activation <= pat->threshold) continue;
+        
+        /* Find this node's position in pattern */
+        int node_position = -1;
+        for (uint32_t i = 0; i < pat->length; i++) {
+            if (MATCHES_BLANK(node_id, pat->node_ids[i])) {
+                node_position = (int)i;
+                break;
+            }
+        }
+        
+        if (node_position >= 0) {
+            /* Node is in pattern - sustain UPCOMING members */
+            /* This is recurrent excitation: current node supports next nodes */
+            for (uint32_t next_pos = node_position + 1; next_pos < pat->length; next_pos++) {
+                uint32_t next_node = pat->node_ids[next_pos];
+                if (next_node < BYTE_VALUES && g->nodes[next_node].exists) {
+                    /* Recurrent support - proportional to pattern activation and position */
+                    /* Closer positions get more support (sequential handoff) */
+                    float position_factor = 1.0f / (float)(next_pos - node_position);
+                    /* RELATIVE: Support proportional to pattern strength, but moderate */
+                    float recurrent_support = pat->activation * pat->strength * position_factor * 0.2f;
+                    
+                    /* Add support to upcoming node (moderate boost, not overwhelming) */
+                    g->nodes[next_node].activation += recurrent_support;
+                    
+                    /* Cap at reasonable level */
+                    if (g->nodes[next_node].activation > 1.5f) {
+                        g->nodes[next_node].activation = 1.5f;
+                    }
+                }
+            }
+            
+            /* Also support pattern predictions (next after pattern) */
+            if (node_position == (int)pat->length - 1) {
+                /* This node is last in pattern - boost predictions */
+                for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
+                    uint32_t pred_node = pat->predicted_nodes[pred];
+                    if (pred_node < BYTE_VALUES && g->nodes[pred_node].exists) {
+                        float pred_support = pat->activation * pat->strength * 0.3f;  /* Moderate boost */
+                        g->nodes[pred_node].activation += pred_support;
+                        if (g->nodes[pred_node].activation > 1.5f) {
+                            g->nodes[pred_node].activation = 1.5f;
+                        }
+                    }
+                }
+            }
+        }
+    }
     
     /* MARK PREDICTION AS USED in all patterns that predicted this node */
     /* This prevents patterns from repeatedly boosting the same node */
@@ -6334,6 +6539,7 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
     for (int n = 0; n < BYTE_VALUES; n++) {
         g->nodes[n].activation = 0.0f;
         g->nodes[n].activated_by = 0;
+        g->nodes[n].adaptation = 0.0f;  /* Reset fatigue each episode */
     }
     
     /* Clear old contributions */
@@ -6421,6 +6627,9 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
     /* Emergency cap: higher for training (with target), lower for generation */
     uint32_t max_steps = (target != NULL && target_len > 0) ? 1000 : 200;
     
+    /* Track consecutive steps without selection (for intelligent stopping) */
+    uint32_t consecutive_no_selection = 0;
+    
     DEBUG_PRINT("DEBUG: Starting loop, max_steps=%u, has_target=%d\n", max_steps, (target != NULL));
     
     for (uint32_t step = 0; step < max_steps; step++) {  /* Emergency cap only */
@@ -6440,6 +6649,7 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
         uint32_t output_node = propagate_with_coherence(g);
         if (step == 0) { DEBUG_PRINT("DEBUG: propagate_with_coherence=%u\n", output_node); }
         
+        #if !SKIP_AGENT_LOG
         // #region agent log
         FILE *f_log = fopen("f:\\Melvin_Research\\Melvin_o7\\melvin_o7\\.cursor\\debug.log", "a");
         if (f_log && step == 0) {
@@ -6478,6 +6688,7 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
             fclose(f);
         }
         // #endregion
+        #endif
         
         /* ====================================================================
          * SELF-REGULATING OUTPUT: Stop based on system signals, not hard limits
@@ -6493,6 +6704,7 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
         if (output_node < BYTE_VALUES && g->nodes[output_node].exists) {
             if (step == 0) { DEBUG_PRINT("DEBUG: emit_output...\n"); }
             
+            #if !SKIP_AGENT_LOG
             // #region agent log
             f_log = fopen("f:\\Melvin_Research\\Melvin_o7\\melvin_o7\\.cursor\\debug.log", "a");
             uint32_t output_len_before = g->output_length;
@@ -6502,10 +6714,12 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
                 fclose(f_log);
             }
             // #endregion
+            #endif
             
             emit_output(g, output_node);
             if (step == 0) { DEBUG_PRINT("DEBUG: emit_output done, len=%u\n", g->output_length); }
             
+            #if !SKIP_AGENT_LOG
             // #region agent log
             f_log = fopen("f:\\Melvin_Research\\Melvin_o7\\melvin_o7\\.cursor\\debug.log", "a");
             if (f_log && step == 0) {
@@ -6517,24 +6731,54 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
                 fclose(f_log);
             }
             // #endregion
+            #endif
             
-            /* CRITICAL: Clear input activation after first output */
-            /* Input is CONTEXT (spark), not persistent state */
-            /* After triggering first output, input should not influence later outputs */
-            if (g->output_length == 1) {
+            /* BIOLOGICAL: Input activation decays naturally, not killed instantly */
+            /* Input is the SPARK that triggers patterns - patterns then sustain themselves */
+            /* The sequence should persist through recurrent pattern support, not input */
+            /* 
+             * RELATIVE: Decay proportional to how much output has been generated
+             * INFLUENCES: How much input context remains
+             * INFLUENCED BY: Output length, pattern strength
+             */
+            if (g->output_length >= 1) {
+                /* Gradual decay of input - proportional to progress through sequence */
+                /* More output = less need for input context */
+                /* RELATIVE: Decay proportional to progress, but not too aggressive */
+                float progress_factor = fminf((float)g->output_length / 10.0f, 1.0f);
+                float input_decay = 0.2f + progress_factor * 0.2f;  /* 0.2-0.4 decay (reduced from 0.5-0.8) */
+                
                 for (uint32_t in = 0; in < g->input_length; in++) {
                     uint32_t input_node = g->input_buffer[in];
                     if (input_node < BYTE_VALUES) {
-                        g->nodes[input_node].activation *= 0.05f;  /* Near-zero */
+                        g->nodes[input_node].activation *= (1.0f - input_decay);
                     }
                 }
             }
         } else {
-            /* No valid node selected - activation exhausted */
-            DEBUG_PRINT("DEBUG: No valid node at step %u, output_len=%u\n", step, g->output_length);
-            if (g->output_length > 0) {
-                break;  /* Have some output, stop */
+            /* No valid node selected - allow propagation to continue */
+            /* This gives the system time to build activation for next characters */
+            consecutive_no_selection++;
+            DEBUG_PRINT("DEBUG: No valid node at step %u, output_len=%u, consecutive_no_selection=%u\n", 
+                   step, g->output_length, consecutive_no_selection);
+            
+            /* SAFETY: If we've tried many times and still can't generate any output, break */
+            /* This prevents infinite loops when system can't activate any nodes */
+            if (step >= 20 && g->output_length == 0) {
+                DEBUG_PRINT("DEBUG: Breaking after %u steps with no output\n", step);
+                break;  /* System stuck - can't generate any output */
             }
+            
+            /* RELATIVE STOPPING: If we've had output but can't select next node for many steps */
+            /* Allow 5-10 steps to build activation, but don't loop forever */
+            /* This balances: give time to build activation vs prevent infinite loops */
+            if (g->output_length > 0 && consecutive_no_selection >= 10) {
+                DEBUG_PRINT("DEBUG: Breaking after %u consecutive steps without selection (output_len=%u)\n", 
+                       consecutive_no_selection, g->output_length);
+                break;  /* Had output but can't continue - likely sequence complete or stuck */
+            }
+            
+            /* The other stop conditions (confidence, energy, completion) will handle natural stopping */
         }
         
         if (step == 0) { DEBUG_PRINT("DEBUG: Checking stop conditions...\n"); }
@@ -6679,8 +6923,8 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
                 initialize_pattern_enhancements(pat);
                 
                 /* Initialize relative to system state */
-                pat->threshold = g->state.avg_threshold;
-                
+                pat->threshold = 0.3f;  /* Local default, adapts via local competition */
+
                 /* Start with good strength for supervised learning (we're teaching it explicitly) */
                 pat->strength = 0.7f;  /* Strong enough to be useful */
                 pat->activation = g->state.avg_activation * 0.2f;
@@ -6692,11 +6936,7 @@ void run_episode(MelvinGraph *g, const uint8_t *input, uint32_t input_len,
                 
                 /* Port from first node */
                 if (seq_len > 0 && pat->node_ids[0] < BYTE_VALUES) {
-                    pat->input_port = g->nodes[pat->node_ids[0]].source_port;
-                    pat->output_port = pat->input_port;
-                } else {
-                    pat->input_port = 0;
-                    pat->output_port = 0;
+                    /* Universal pattern - no port tracking (ports handle conversion externally) */
                 }
                 
                 /* Context vector */
@@ -7128,28 +7368,37 @@ void learn_pattern_predictions(MelvinGraph *g, const uint8_t *target, uint32_t t
         }
     }
     
-    /* CRITICAL FIX: Learn input→output mappings */
-    /* When patterns match INPUT, learn to predict TARGET nodes */
-    /* This enables "hello" → "world" learning */
-    fprintf(stderr, "LEARN_PATTERN_PRED: Checking %u patterns against input\n", g->pattern_count);
+    /* ========================================================================
+     * SEQUENCE LEARNING: When patterns appear in target, learn what comes NEXT
+     * 
+     * RELATIVE: Pattern predicts based on WHERE it appears in sequence
+     * SELF-REGULATING: Predictions strengthen with repeated observations
+     * ======================================================================== */
     for (uint32_t p = 0; p < g->pattern_count; p++) {
         Pattern *pat = &g->patterns[p];
         
-        /* Check if pattern matches INPUT (not just target) */
-        if (g->input_length >= pat->length) {
-            for (uint32_t input_pos = 0; input_pos <= g->input_length - pat->length; input_pos++) {
-                if (pattern_matches(g, p, g->input_buffer, g->input_length, input_pos)) {
-                    fprintf(stderr, "LEARN_PATTERN_PRED: Pattern %u (len=%u) matched input at pos %u, learning prediction to target[0]=%u\n",
-                            p, pat->length, input_pos, target[0]);
-                    /* Pattern matches input! Learn to predict TARGET nodes */
-                    if (target_len > 0) {
-                        /* Learn to predict first node of target */
-                        uint32_t target_node = target[0];
+        /* Convert target to node IDs for matching */
+        uint32_t target_nodes[256];
+        uint32_t target_node_len = (target_len < 256) ? target_len : 256;
+        for (uint32_t i = 0; i < target_node_len; i++) {
+            target_nodes[i] = target[i];
+        }
+        
+        /* Check if pattern appears in target sequence */
+        if (target_len >= pat->length) {
+            for (uint32_t pos = 0; pos <= target_len - pat->length; pos++) {
+                if (pattern_matches(g, p, target_nodes, target_node_len, pos)) {
+                    /* Pattern found at position 'pos' in target! */
+                    /* Learn to predict what comes AFTER this pattern */
+                    uint32_t next_pos = pos + pat->length;
+                    
+                    if (next_pos < target_len) {
+                        uint32_t next_node = target[next_pos];
                         
                         /* Find or add prediction */
                         bool found = false;
                         for (uint32_t pred = 0; pred < pat->prediction_count; pred++) {
-                            if (pat->predicted_nodes[pred] == target_node) {
+                            if (pat->predicted_nodes[pred] == next_node) {
                                 /* Strengthen existing prediction */
                                 pat->prediction_weights[pred] += 0.3f * g->state.learning_rate;
                                 if (pat->prediction_weights[pred] > 1.0f) {
@@ -7161,7 +7410,7 @@ void learn_pattern_predictions(MelvinGraph *g, const uint8_t *target, uint32_t t
                         }
                         
                         if (!found) {
-                            /* Add new prediction: pattern → target node */
+                            /* Add new prediction: pattern → next node */
                             if (pat->prediction_count == 0) {
                                 pat->predicted_nodes = malloc(sizeof(uint32_t) * 4);
                                 pat->prediction_weights = malloc(sizeof(float) * 4);
@@ -7173,12 +7422,11 @@ void learn_pattern_predictions(MelvinGraph *g, const uint8_t *target, uint32_t t
                                                                   sizeof(float) * (pat->prediction_count + 4));
                             }
                             
-                            pat->predicted_nodes[pat->prediction_count] = target_node;
-                            pat->prediction_weights[pat->prediction_count] = 1.0f;  /* Full strength when learned from target */
+                            pat->predicted_nodes[pat->prediction_count] = next_node;
+                            pat->prediction_weights[pat->prediction_count] = 1.0f;
                             pat->prediction_count++;
                         }
                     }
-                    break;  /* Found match, move to next pattern */
                 }
             }
         }
@@ -7357,14 +7605,8 @@ void melvin_set_context(MelvinGraph *g, float *context) {
 }
 
 /* Set input port (0=text, 1=audio, 2=vision, 3=motor, etc.) */
-void melvin_set_input_port(MelvinGraph *g, uint32_t port_id) {
-    g->current_input_port = port_id;
-}
-
-/* Set output port (0=text, 1=audio, 2=vision, 3=motor, etc.) */
-void melvin_set_output_port(MelvinGraph *g, uint32_t port_id) {
-    g->current_output_port = port_id;
-}
+/* Port functions removed - use melvin_ports.c for conversion */
+/* melvin.c only handles universal bytes - ports convert externally */
 
 /* ============================================================================
  * BRAIN I/O: .m file IS the brain (not just data)
@@ -7423,7 +7665,7 @@ int melvin_save_brain(MelvinGraph *g, const char *filename) {
             if (utility > 1.0f) utility = 1.0f;  /* Cap utility at 1.0 */
             fprintf(f, " utility:%.4f", utility);
         }
-        fprintf(f, " port_in:%u port_out:%u", pat->input_port, pat->output_port);
+        /* Port tracking removed - ports handle conversion externally */
         fprintf(f, "\n");
     }
     
@@ -7577,18 +7819,7 @@ MelvinGraph* melvin_load_brain(const char *filename) {
             }
             
             /* Parse ports */
-            char *port_in_str = strstr(line, "port_in:");
-            char *port_out_str = strstr(line, "port_out:");
-            if (port_in_str) {
-                sscanf(port_in_str, "port_in:%u", &pat->input_port);
-            } else {
-                pat->input_port = 0;  /* Default */
-            }
-            if (port_out_str) {
-                sscanf(port_out_str, "port_out:%u", &pat->output_port);
-            } else {
-                pat->output_port = 0;  /* Default */
-            }
+            /* Port tracking removed - ports handle conversion externally */
             
             /* Initialize other fields */
             pat->sub_pattern_ids = NULL;
